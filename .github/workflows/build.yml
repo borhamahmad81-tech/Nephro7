@@ -1,0 +1,41 @@
+name: Build EXE
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build main tool EXE
+        run: |
+          pyinstaller --onefile --noconsole --name MedvisionSync gui.py
+
+      - name: Build diagnostic EXE
+        run: |
+          pyinstaller --onefile --name Diagnose diagnose.py
+
+      - name: Upload main tool artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MedvisionSync-exe
+          path: dist/MedvisionSync.exe
+
+      - name: Upload diagnostic artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Diagnose-exe
+          path: dist/Diagnose.exe
