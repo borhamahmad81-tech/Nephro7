@@ -1,0 +1,7 @@
+python-docx>=1.0.0
+pyautogui>=0.9.54
+opencv-python>=4.8.0
+pyperclip>=1.8.2
+pygetwindow>=0.0.9
+pywin32>=306
+pytesseract>=0.3.10
