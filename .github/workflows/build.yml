@@ -15,22 +15,35 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install Tesseract OCR
+        run: choco install tesseract -y
+
+      - name: Install Python dependencies
         run: |
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Build main tool EXE
+      - name: Build main tool EXE (bundles Tesseract)
+        shell: pwsh
         run: |
-          pyinstaller --onefile --noconsole --name MedvisionSync --collect-all cv2 gui.py
+          pyinstaller --onefile --noconsole --name MedvisionSync `
+            --collect-all cv2 `
+            --add-binary "C:\Program Files\Tesseract-OCR\tesseract.exe;tesseract" `
+            --add-data "C:\Program Files\Tesseract-OCR\tessdata;tesseract\tessdata" `
+            gui.py
 
       - name: Build diagnostic EXE
         run: |
           pyinstaller --onefile --name Diagnose --collect-all cv2 diagnose.py
 
-      - name: Build detection self-test EXE
+      - name: Build detection self-test EXE (bundles Tesseract)
+        shell: pwsh
         run: |
-          pyinstaller --onefile --name TestDetection --collect-all cv2 test_detection.py
+          pyinstaller --onefile --name TestDetection `
+            --collect-all cv2 `
+            --add-binary "C:\Program Files\Tesseract-OCR\tesseract.exe;tesseract" `
+            --add-data "C:\Program Files\Tesseract-OCR\tessdata;tesseract\tessdata" `
+            test_detection.py
 
       - name: Upload main tool artifact
         uses: actions/upload-artifact@v4
