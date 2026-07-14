@@ -77,7 +77,13 @@ class MedvisionApp:
         ).pack(anchor="w", padx=10, pady=(8, 0))
         self.patient_load_timeout_var = tk.DoubleVar(value=90)
         self.save_commit_timeout_var = tk.DoubleVar(value=90)
+        self.search_open_timeout_var = tk.DoubleVar(value=30)
+        self.note_editor_timeout_var = tk.DoubleVar(value=90)
+        self.verify_open_timeout_var = tk.DoubleVar(value=30)
+        self._add_slider(timing, "Search Dialog Max Wait (s)", self.search_open_timeout_var, 5, 120)
         self._add_slider(timing, "Patient Load Max Wait (s)", self.patient_load_timeout_var, 10, 180)
+        self._add_slider(timing, "Note Editor Max Wait (s)", self.note_editor_timeout_var, 10, 180)
+        self._add_slider(timing, "Verification Dialog Max Wait (s)", self.verify_open_timeout_var, 5, 120)
         self._add_slider(timing, "Save Commit Max Wait (s)", self.save_commit_timeout_var, 10, 180)
 
         # --- Mode + tab assumption + password ---
@@ -232,7 +238,10 @@ class MedvisionApp:
                 ):
                     return
 
+        self.engine.search_open_timeout = self.search_open_timeout_var.get()
         self.engine.patient_load_timeout = self.patient_load_timeout_var.get()
+        self.engine.note_editor_timeout = self.note_editor_timeout_var.get()
+        self.engine.verify_open_timeout = self.verify_open_timeout_var.get()
         self.engine.save_commit_timeout = self.save_commit_timeout_var.get()
         self.engine.assume_progress_tab_active = self.tab_active_var.get()
         self.engine.guided_mode = (self.mode_var.get() == "guided")

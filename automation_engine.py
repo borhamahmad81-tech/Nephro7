@@ -57,10 +57,10 @@ class AutomationEngine:
         self._pause_flag = threading.Event()
 
         # Poll timeouts (ceilings, not fixed waits) - overridable from GUI
-        self.search_open_timeout = 15
+        self.search_open_timeout = 30
         self.patient_load_timeout = 90     # covers cloud/RDP lag opening the record
-        self.note_editor_timeout = 30
-        self.verify_open_timeout = 20
+        self.note_editor_timeout = 90
+        self.verify_open_timeout = 30
         self.save_commit_timeout = 90      # covers cloud/RDP lag on save/commit
         self.poll_interval = 0.3
 
@@ -325,7 +325,7 @@ class AutomationEngine:
         appeared = False
         try:
             self._wait_for_template(
-                TEMPLATE_SEARCH_PATIENTS, True, min(5, self.search_open_timeout),
+                TEMPLATE_SEARCH_PATIENTS, True, min(15, self.search_open_timeout),
                 label="search dialog open"
             )
             appeared = True
@@ -364,24 +364,14 @@ class AutomationEngine:
         self._ensure_progress_tab()
         self._check_abort()
 
-        # 5. New Progress Note entry - with one retry, same reasoning as F3
+        # 5. New Progress Note entry - single generous wait, NO retry: unlike
+        # F3 (safe to press twice), pressing Ctrl+Insert again if the first
+        # press just worked slowly could create a duplicate blank note.
         pyautogui.hotkey("ctrl", "insert")
-        editor_box = None
-        try:
-            editor_box = self._wait_for_template(
-                TEMPLATE_PROGRESS_NOTES, True, min(6, self.note_editor_timeout),
-                label="note editor opened"
-            )
-        except RuntimeError:
-            pass
-
-        if editor_box is None:
-            self.log("warn", "Note editor didn't appear yet - retrying Ctrl+Insert once.")
-            pyautogui.hotkey("ctrl", "insert")
-            editor_box = self._wait_for_template(
-                TEMPLATE_PROGRESS_NOTES, True, self.note_editor_timeout,
-                label="note editor opened (retry)"
-            )
+        editor_box = self._wait_for_template(
+            TEMPLATE_PROGRESS_NOTES, True, self.note_editor_timeout,
+            label="note editor opened"
+        )
         self._check_abort()
         time.sleep(0.6)  # settle before reading/pasting
 
