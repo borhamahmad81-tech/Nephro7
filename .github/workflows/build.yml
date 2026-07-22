@@ -32,23 +32,8 @@ jobs:
             --add-data "C:\Program Files\Tesseract-OCR\tessdata;tesseract\tessdata" `
             gui.py
 
-      - name: Build detection self-test EXE (bundles Tesseract)
-        shell: pwsh
-        run: |
-          pyinstaller --onefile --name TestDetection `
-            --collect-all cv2 `
-            --add-binary "C:\Program Files\Tesseract-OCR\tesseract.exe;tesseract" `
-            --add-data "C:\Program Files\Tesseract-OCR\tessdata;tesseract\tessdata" `
-            test_detection.py
-
       - name: Upload main tool artifact
         uses: actions/upload-artifact@v4
         with:
           name: MedvisionSync-exe
           path: dist/MedvisionSync.exe
-
-      - name: Upload detection self-test artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: TestDetection-exe
-          path: dist/TestDetection.exe
