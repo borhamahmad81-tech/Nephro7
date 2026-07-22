@@ -528,36 +528,56 @@ class AutomationEngine:
         rather than paste into a half-cleared note.
         """
 
+        def _hold_combo(modifiers, key):
+            """
+            Send a modifier combo by explicitly holding the modifier(s) DOWN,
+            pressing the key, then releasing - with delays at each step.
+
+            pyautogui.hotkey() fires the whole combo in a few milliseconds,
+            and over this RDP link the MODIFIER gets dropped while the base key
+            still registers - so Ctrl+Shift+End degrades to plain End (caret
+            jumps to the bottom, nothing selected) and Ctrl+Home degrades to
+            Home. Holding the modifier down across a real delay before the key
+            press gives RDP time to actually register it, which is how a human
+            holding the keys down succeeds where the fast combo fails.
+            """
+            for m in modifiers:
+                pyautogui.keyDown(m)
+                time.sleep(0.12)
+            pyautogui.press(key)
+            time.sleep(0.12)
+            for m in reversed(modifiers):
+                pyautogui.keyUp(m)
+                time.sleep(0.08)
+
         def _do_delete_sequence():
             self._park_cursor_safe()
 
-            # STEP 1: Click into the editor text area to LOCK INPUT FOCUS. This
-            # is the crucial fix - the manual steps that work 100% of the time
-            # always start with a click. Firing keys "cold" lets RDP drop the
-            # first Ctrl (focus not live yet), so Ctrl+Shift+End degraded to
-            # Shift+End and selected/deleted nothing. The click only needs to
-            # land somewhere inside the editor body; Ctrl+Home right after
-            # resets the caret to a known position regardless of where it hit.
-            # Anchored to the matched editor template so it tracks the window.
+            # STEP 1: Click into the editor text area to lock input focus, the
+            # way the working manual steps always start. Anchored to the matched
+            # editor template so it tracks the window. It only needs to land
+            # inside the text body; the Ctrl+Home right after resets the caret.
             bx, by = int(editor_box.left), int(editor_box.top)
             bh = int(editor_box.height)
             focus_x = bx + 60
             focus_y = by + bh + 100  # inside the text area, below the header
             self.log("info", f"Clicking editor to lock focus at ({focus_x}, {focus_y}).")
             pyautogui.click(focus_x, focus_y)
-            time.sleep(0.3)
+            time.sleep(0.4)
 
-            # STEP 2: With focus now live, position at end of the single header
-            # line and add ONE blank line below it.
-            pyautogui.hotkey("ctrl", "home")
+            # STEP 2: Go to end of the single header line, add ONE blank line.
+            # Modifier combos use _hold_combo so the modifier isn't dropped.
+            _hold_combo(["ctrl"], "home")     # to very top (start of header)
             time.sleep(0.3)
-            pyautogui.press("end")            # end of the header line (only 1 line)
+            pyautogui.press("end")            # end of header line (plain key, safe)
             time.sleep(0.2)
             pyautogui.press("enter")          # one blank line below the header
             time.sleep(0.2)
 
-            # STEP 3: Select everything from here to the end and delete it.
-            pyautogui.hotkey("ctrl", "shift", "end")
+            # STEP 3: Select from here to the very end, then delete. Ctrl+Shift
+            # held down explicitly so neither modifier gets dropped (that was
+            # the bug: it degraded to plain End = no selection).
+            _hold_combo(["ctrl", "shift"], "end")
             time.sleep(0.2)
             pyautogui.press("delete")
             time.sleep(0.4)
