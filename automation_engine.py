@@ -119,6 +119,14 @@ class AutomationEngine:
         # lower.
         self.editor_click_dy = 190
 
+        # Estimated character count of the fixed template body (from
+        # "Complaint:" through "Educational:", the part that gets deleted).
+        # Computed from the template text as pasted by the user. Used ONLY as
+        # the fallback backspace method's first big chunk - it does not need
+        # to be exact, since a top-up loop (checked via OCR) corrects any
+        # shortfall, and the header-present check aborts if it ever overshoots.
+        self.backspace_estimate = 320
+
         # pygetwindow/win32gui used ONLY to verify the local RDP client window
         # has real OS focus - not used for anything happening inside the
         # remote session (see module docstring).
@@ -580,50 +588,37 @@ class AutomationEngine:
 
     def _clear_template_body(self, editor_box, expected_id):
         """
-        Keep the bold header line, delete the template body below it - by
-        deleting BACKWARDS (Backspace) from the end of the template.
+        Keep the bold header line, delete the template body below it.
 
-        Why this method: over this RDP link, modifier keys (Ctrl, Shift) get
-        dropped while plain keys survive, so Ctrl+Shift+End degraded to plain
-        End (caret jumps to the bottom, selects nothing) and every
-        select-and-delete approach failed. Backspace is a PLAIN key - it never
-        drops - and the caret reliably ends up at the bottom of the template
-        already. So we delete upward with Backspace.
+        IMPORTANT CORRECTION: earlier attempts at select-and-delete
+        (Ctrl+Shift+End -> Delete) failed, which we attributed to RDP dropping
+        the Ctrl/Shift modifiers. But the focus-lock click used in BOTH that
+        attempt and the first backspace attempt was landing on the TOOLBAR
+        (wrong pixel offset), not the text - so focus may never have reached
+        the document at all, which would explain every keystroke afterward
+        going nowhere, with no need to invoke "RDP eats modifiers." That was
+        our bug, not confirmed RDP behaviour.
 
-        The danger: holding Backspace does NOT stop at the header - it eats
-        into the bold header too (confirmed). So this is done in a VERIFIED
-        loop, never blindly:
-          1. Ctrl+End (held) to make sure we're at the very bottom. (If the
-             modifier drops, we're likely already at the bottom anyway from
-             opening the editor - harmless.)
-          2. Delete a small BATCH of backspaces.
-          3. OCR the editor: has the body ('Educational' ... 'Complaint')
-             gone, and is the header ID STILL present?
-               - Header ID gone  -> we've overshot into the header: ABORT
-                 immediately (never save a damaged header).
-               - Body still present -> loop, delete another batch.
-               - Body gone AND header present -> success, stop.
-          4. Bounded by a max number of batches so it can't loop forever.
+        Now that the focus click is corrected (self.editor_click_dy, verified
+        landing on body text), it's worth retrying the fast method:
 
-        This trades a bit of speed for safety: the stop condition is OCR-
-        verified every batch, not counted or guessed.
+          FAST PATH: click into text (focus) -> Ctrl+Home -> End -> Enter
+          (one blank line below header) -> Ctrl+Shift+End -> Delete. One shot,
+          then ONE OCR check.
+            - If body's gone (sentinel 'Complaint' absent) and header intact
+              -> done, fast.
+
+          FALLBACK (only if the fast path's single check shows the body is
+          STILL there): delete via Backspace from the bottom - a plain key
+          that cannot have its modifier dropped. Rather than nagging in tiny
+          batches of 6, send ONE large estimated chunk (self.
+          backspace_estimate, ~318 chars, sized from the known fixed
+          template), THEN check once. If short, top up in a couple of small
+          batches; if it overshoots into the header, abort immediately
+          (header-loss is checked every step of the fallback, never skipped).
         """
-        BATCH = 6            # backspaces per batch before re-checking. Modest,
-                             # so any overshoot past 'Complaint' into the header
-                             # is bounded to a few chars - and the header-present
-                             # OCR check catches even that before anything saves.
-        MAX_BATCHES = 200    # hard ceiling then abort (200*6 = 1200 backspaces)
-
         self._park_cursor_safe()
 
-        # Click into the editor BODY TEXT to lock input focus (confirmed
-        # manually: clicking the text then backspace works; clicking the
-        # toolbar does nothing). The editor opens at a consistent vertical
-        # position, so we click a fixed distance BELOW the matched PROGRESS
-        # NOTES tab template - far enough to land on the body text (around the
-        # "Complaint" line), not the toolbar/ruler just under the tab. Anchored
-        # to editor_box so it still tracks horizontal window position.
-        # editor_click_dy is tunable if the click misses the text.
         bx, by = int(editor_box.left), int(editor_box.top)
         focus_x = bx + 60
         focus_y = by + self.editor_click_dy
@@ -631,9 +626,56 @@ class AutomationEngine:
         pyautogui.click(focus_x, focus_y)
         time.sleep(0.4)
 
-        # Move to the very end of the document. Ctrl+End held explicitly; even
-        # if the modifier drops, the editor typically opens with the caret at
-        # the end already, so this is a best-effort nudge, not relied upon.
+        # ---------- FAST PATH: select-and-delete, one attempt ----------
+        for m in ["ctrl"]:
+            pyautogui.keyDown(m)
+            time.sleep(0.12)
+        pyautogui.press("home")
+        time.sleep(0.12)
+        pyautogui.keyUp("ctrl")
+        time.sleep(0.3)
+
+        pyautogui.press("end")          # end of the single header line
+        time.sleep(0.2)
+        pyautogui.press("enter")        # one blank line below the header
+        time.sleep(0.2)
+
+        for m in ["ctrl", "shift"]:
+            pyautogui.keyDown(m)
+            time.sleep(0.12)
+        pyautogui.press("end")
+        time.sleep(0.12)
+        for m in reversed(["ctrl", "shift"]):
+            pyautogui.keyUp(m)
+            time.sleep(0.08)
+        time.sleep(0.2)
+        pyautogui.press("delete")
+        time.sleep(0.5)
+
+        header_present, body_present = self._read_clear_state(editor_box, expected_id)
+        self.log("info",
+                 f"Fast-path check: header_present={header_present}, "
+                 f"body_present={body_present}")
+
+        if not body_present and header_present:
+            self.log("success", "Template body cleared via select+delete (fast path).")
+            return
+
+        if not header_present:
+            # The fast path already damaged the header - abort immediately.
+            self._save_timeout_screenshot("header_overshoot_fastpath")
+            raise RuntimeError(
+                f"Select+delete appears to have damaged the header (patient "
+                f"ID {expected_id} no longer visible) - aborting. A screenshot "
+                "was saved."
+            )
+
+        # ---------- FALLBACK: backspace, one big estimated chunk + top-up ----------
+        self.log("warn",
+                 "Fast path (select+delete) did not clear the body - falling "
+                 "back to backspace clearing.")
+
+        # Re-anchor to the end of the document before backspacing.
         for m in ["ctrl"]:
             pyautogui.keyDown(m)
             time.sleep(0.12)
@@ -642,53 +684,47 @@ class AutomationEngine:
         pyautogui.keyUp("ctrl")
         time.sleep(0.3)
 
-        for batch in range(MAX_BATCHES):
-            self._check_abort()
+        # One big estimated chunk (sized from the known fixed template length),
+        # THEN check once - not nagging every few characters.
+        self.log("info", f"Backspacing estimated chunk of {self.backspace_estimate} chars...")
+        for _ in range(self.backspace_estimate):
+            pyautogui.press("backspace")
+            time.sleep(0.02)
+        time.sleep(0.3)
 
-            self.log("info", f"Clear check {batch + 1}: reading screen...")
+        TOP_UP = 15
+        MAX_TOP_UPS = 20
+        for i in range(MAX_TOP_UPS):
+            self._check_abort()
             header_present, body_present = self._read_clear_state(editor_box, expected_id)
             self.log("info",
-                     f"Clear check {batch + 1}: header_present={header_present}, "
+                     f"Backspace check {i + 1}: header_present={header_present}, "
                      f"body_present={body_present}")
 
             if not header_present:
-                if batch == 0:
-                    # Nothing deleted yet - a missing header here means OCR
-                    # couldn't read it, NOT an overshoot. Don't abort on this;
-                    # log and proceed to delete a batch, then re-check.
-                    self.log("warn",
-                             "Header ID not read on first check (likely OCR) - "
-                             "proceeding cautiously.")
-                else:
-                    # We've already deleted and now the header ID is gone - we
-                    # overshot into the header. Stop NOW and abort; a damaged
-                    # bold header must never be saved.
-                    self._save_timeout_screenshot("header_overshoot")
-                    raise RuntimeError(
-                        f"Backspace clear overshot the header (patient ID "
-                        f"{expected_id} no longer visible) - aborting to avoid "
-                        "saving a damaged header. A screenshot was saved."
-                    )
+                self._save_timeout_screenshot("header_overshoot")
+                raise RuntimeError(
+                    f"Backspace clear overshot the header (patient ID "
+                    f"{expected_id} no longer visible) - aborting to avoid "
+                    "saving a damaged header. A screenshot was saved."
+                )
 
             if not body_present:
-                # Body gone, header intact - done.
                 self.log("success",
-                         f"Template body cleared via backspace after "
-                         f"{batch} batch(es), header intact.")
+                         f"Template body cleared via backspace fallback "
+                         f"(estimated chunk + {i} top-up(s)), header intact.")
                 return
 
-            # Body still there - delete another batch of backspaces.
-            for _ in range(BATCH):
+            for _ in range(TOP_UP):
                 pyautogui.press("backspace")
-                time.sleep(0.03)
+                time.sleep(0.02)
             time.sleep(0.3)
 
-        # Ran out of batches without clearing - stop rather than continue.
         self._save_timeout_screenshot("body_not_cleared")
         raise RuntimeError(
-            "Could not clear the template body with backspace within the batch "
-            "limit - stopping rather than pasting under a partial template. "
-            "A screenshot was saved."
+            "Could not clear the template body (fast path and backspace "
+            "fallback both failed) - stopping rather than pasting under a "
+            "partial template. A screenshot was saved."
         )
 
     def _read_clear_state(self, editor_box, expected_id):
