@@ -110,6 +110,15 @@ class AutomationEngine:
         # stop far too early.) It must not appear in the one-line header.
         self.clear_sentinel = "Complaint"
 
+        # Vertical offset (pixels) from the TOP of the matched PROGRESS NOTES
+        # tab template down to the editor BODY TEXT (around the "Complaint"
+        # line), where we click to lock input focus before clearing. The old
+        # value landed on the toolbar (focus didn't lock, backspace did
+        # nothing). The editor opens at a consistent vertical spot, so a fixed
+        # offset works. If the focus-click misses the text, adjust: larger =
+        # lower.
+        self.editor_click_dy = 190
+
         # pygetwindow/win32gui used ONLY to verify the local RDP client window
         # has real OS focus - not used for anything happening inside the
         # remote session (see module docstring).
@@ -605,13 +614,18 @@ class AutomationEngine:
 
         self._park_cursor_safe()
 
-        # Click into the editor body to lock input focus (mouse events survive
-        # RDP reliably; this is what the working manual steps always do first).
+        # Click into the editor BODY TEXT to lock input focus (confirmed
+        # manually: clicking the text then backspace works; clicking the
+        # toolbar does nothing). The editor opens at a consistent vertical
+        # position, so we click a fixed distance BELOW the matched PROGRESS
+        # NOTES tab template - far enough to land on the body text (around the
+        # "Complaint" line), not the toolbar/ruler just under the tab. Anchored
+        # to editor_box so it still tracks horizontal window position.
+        # editor_click_dy is tunable if the click misses the text.
         bx, by = int(editor_box.left), int(editor_box.top)
-        bh = int(editor_box.height)
         focus_x = bx + 60
-        focus_y = by + bh + 100
-        self.log("info", f"Clicking editor to lock focus at ({focus_x}, {focus_y}).")
+        focus_y = by + self.editor_click_dy
+        self.log("info", f"Clicking editor body to lock focus at ({focus_x}, {focus_y}).")
         pyautogui.click(focus_x, focus_y)
         time.sleep(0.4)
 
