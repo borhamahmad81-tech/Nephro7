@@ -32,10 +32,6 @@ jobs:
             --add-data "C:\Program Files\Tesseract-OCR\tessdata;tesseract\tessdata" `
             gui.py
 
-      - name: Build diagnostic EXE
-        run: |
-          pyinstaller --onefile --name Diagnose --collect-all cv2 diagnose.py
-
       - name: Build detection self-test EXE (bundles Tesseract)
         shell: pwsh
         run: |
@@ -50,12 +46,6 @@ jobs:
         with:
           name: MedvisionSync-exe
           path: dist/MedvisionSync.exe
-
-      - name: Upload diagnostic artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Diagnose-exe
-          path: dist/Diagnose.exe
 
       - name: Upload detection self-test artifact
         uses: actions/upload-artifact@v4
