@@ -103,7 +103,12 @@ class AutomationEngine:
         # (the last template line) is the default. Checked BEFORE paste, so a
         # note that happens to contain the word later cannot cause a false
         # positive.
-        self.clear_sentinel = "Educational"
+        # Sentinel word used to confirm the template body is fully deleted.
+        # Because the backspace clear deletes BOTTOM-UP, the FIRST body line
+        # ('Complaint') is the LAST thing to disappear - so its absence means
+        # the whole body is gone. (If it were the bottom line, the loop would
+        # stop far too early.) It must not appear in the one-line header.
+        self.clear_sentinel = "Complaint"
 
         # pygetwindow/win32gui used ONLY to verify the local RDP client window
         # has real OS focus - not used for anything happening inside the
@@ -340,6 +345,71 @@ class AutomationEngine:
         else:
             self.log("warn", "Progress Notes tab image not found - assuming it's already active.")
 
+    def _wait_for_patient_in_notes_panel(self, expected_id, timeout=None):
+        """
+        Wait until the DOCKED Progress Notes panel shows the expected patient's
+        ID, i.e. the new patient's notes have actually finished loading over
+        RDP - before we open a new note. This is the real "safe to proceed"
+        signal, unlike the "Administration no." field which updates too early.
+
+        Anchored to the new-note-icon template (which lives in the docked
+        panel's toolbar): once found, we OCR a region spanning the panel's
+        content area just below it and look for the expected ID. If the panel
+        still shows the PREVIOUS patient (different ID), we keep waiting; if the
+        new ID never appears within the timeout, we STOP rather than risk
+        opening a note against a half-loaded/previous patient.
+        """
+        if timeout is None:
+            timeout = self.patient_load_timeout
+
+        deadline = time.time() + timeout
+        last_text = ""
+        while time.time() < deadline:
+            self._check_abort()
+
+            # Locate the docked panel via the new-note icon anchor (it sits in
+            # that panel's toolbar). This makes the OCR region track the window.
+            anchor = self._find_on_screen(TEMPLATE_NEW_NOTE_ICON)
+            if anchor is None:
+                # Panel/icon not visible yet (still loading or covered) - wait.
+                time.sleep(0.5)
+                continue
+
+            try:
+                screen_w, screen_h = pyautogui.size()
+                # OCR a band starting just below the icon/toolbar, covering the
+                # panel's header/content lines where "Lastname, Firstname (ID)"
+                # appears.
+                left = int(anchor.left) - 10
+                top = int(anchor.top) + int(anchor.height) + 20
+                width = 520
+                height = 120
+
+                left = max(0, min(left, int(screen_w) - 1))
+                top = max(0, min(top, int(screen_h) - 1))
+                width = max(1, min(width, int(screen_w) - left))
+                height = max(1, min(height, int(screen_h) - top))
+
+                last_text = self._read_region_text(left, top, width, height)
+                digits = "".join(c for c in last_text if c.isdigit())
+                if expected_id in digits:
+                    self.log("success",
+                             f"Progress Notes panel shows patient {expected_id} "
+                             "- fully loaded, safe to open a note.")
+                    return
+            except Exception as exc:
+                self.log("error", f"Notes-panel OCR error: {type(exc).__name__}: {exc}")
+
+            time.sleep(0.5)
+
+        self._save_timeout_screenshot("patient_not_loaded_in_panel")
+        raise RuntimeError(
+            f"The Progress Notes panel never showed patient {expected_id} "
+            f"within {timeout}s (last OCR: '{last_text.strip()[:60]}') - "
+            "stopping rather than opening a note against the wrong or "
+            "half-loaded patient. A screenshot was saved."
+        )
+
     def _click_new_note_icon(self, timeout):
         """
         Open a new progress note by CLICKING the new-note icon, rather than
@@ -499,124 +569,125 @@ class AutomationEngine:
         digits = "".join(c for c in text if c.isdigit())
         return expected_id in digits
 
-    def _clear_template_body(self, editor_box):
+    def _clear_template_body(self, editor_box, expected_id):
         """
-        Keep the bold header line, delete the template body below it.
+        Keep the bold header line, delete the template body below it - by
+        deleting BACKWARDS (Backspace) from the end of the template.
 
-        Method: PUSH the template down with Enter, then select-and-delete it -
-        rather than trying to precisely navigate TO the template first. This
-        avoids the two failure modes hit earlier:
-          - Down-counting drifted (miscounted lines -> landed at document end,
-            so select/delete hit nothing and backspaces damaged "Educational").
-          - Clicking required knowing the on-screen pixel offset to "Complaint",
-            which was a guess.
+        Why this method: over this RDP link, modifier keys (Ctrl, Shift) get
+        dropped while plain keys survive, so Ctrl+Shift+End degraded to plain
+        End (caret jumps to the bottom, selects nothing) and every
+        select-and-delete approach failed. Backspace is a PLAIN key - it never
+        drops - and the caret reliably ends up at the bottom of the template
+        already. So we delete upward with Backspace.
 
-        Sequence: Ctrl+Home (x2, drop-guard - this is the one genuinely risky
-        first keystroke) -> End (end of the SINGLE header line - unambiguous,
-        no counting) -> Enter, Enter (pushes the template down 2 lines,
-        leaving the caret 2 lines below the header - exactly where the note
-        should start, with one blank line preserved above it) -> Ctrl+Shift+End
-        (select everything from there to the true end - the old blank line +
-        the whole pushed-down template - confirmed working in this editor) ->
-        Delete.
+        The danger: holding Backspace does NOT stop at the header - it eats
+        into the bold header too (confirmed). So this is done in a VERIFIED
+        loop, never blindly:
+          1. Ctrl+End (held) to make sure we're at the very bottom. (If the
+             modifier drops, we're likely already at the bottom anyway from
+             opening the editor - harmless.)
+          2. Delete a small BATCH of backspaces.
+          3. OCR the editor: has the body ('Educational' ... 'Complaint')
+             gone, and is the header ID STILL present?
+               - Header ID gone  -> we've overshot into the header: ABORT
+                 immediately (never save a damaged header).
+               - Body still present -> loop, delete another batch.
+               - Body gone AND header present -> success, stop.
+          4. Bounded by a max number of batches so it can't loop forever.
 
-        Since it's the template being deleted anyway, pushing it down first
-        costs nothing - the header is never selected because End guarantees
-        the caret starts strictly after it.
-
-        Then OCR-verifies the body actually cleared; retries once; else raises
-        rather than paste into a half-cleared note.
+        This trades a bit of speed for safety: the stop condition is OCR-
+        verified every batch, not counted or guessed.
         """
+        BATCH_FAR = 25       # backspaces per batch while clearly far from header
+        BATCH_NEAR = 4       # small batch once close, to avoid overshooting header
+        MAX_BATCHES = 80     # hard ceiling then abort
 
-        def _hold_combo(modifiers, key):
-            """
-            Send a modifier combo by explicitly holding the modifier(s) DOWN,
-            pressing the key, then releasing - with delays at each step.
+        self._park_cursor_safe()
 
-            pyautogui.hotkey() fires the whole combo in a few milliseconds,
-            and over this RDP link the MODIFIER gets dropped while the base key
-            still registers - so Ctrl+Shift+End degrades to plain End (caret
-            jumps to the bottom, nothing selected) and Ctrl+Home degrades to
-            Home. Holding the modifier down across a real delay before the key
-            press gives RDP time to actually register it, which is how a human
-            holding the keys down succeeds where the fast combo fails.
-            """
-            for m in modifiers:
-                pyautogui.keyDown(m)
-                time.sleep(0.12)
-            pyautogui.press(key)
+        # Click into the editor body to lock input focus (mouse events survive
+        # RDP reliably; this is what the working manual steps always do first).
+        bx, by = int(editor_box.left), int(editor_box.top)
+        bh = int(editor_box.height)
+        focus_x = bx + 60
+        focus_y = by + bh + 100
+        self.log("info", f"Clicking editor to lock focus at ({focus_x}, {focus_y}).")
+        pyautogui.click(focus_x, focus_y)
+        time.sleep(0.4)
+
+        # Move to the very end of the document. Ctrl+End held explicitly; even
+        # if the modifier drops, the editor typically opens with the caret at
+        # the end already, so this is a best-effort nudge, not relied upon.
+        for m in ["ctrl"]:
+            pyautogui.keyDown(m)
             time.sleep(0.12)
-            for m in reversed(modifiers):
-                pyautogui.keyUp(m)
-                time.sleep(0.08)
+        pyautogui.press("end")
+        time.sleep(0.12)
+        pyautogui.keyUp("ctrl")
+        time.sleep(0.3)
 
-        def _do_delete_sequence():
-            self._park_cursor_safe()
+        for batch in range(MAX_BATCHES):
+            self._check_abort()
 
-            # STEP 1: Click into the editor text area to lock input focus, the
-            # way the working manual steps always start. Anchored to the matched
-            # editor template so it tracks the window. It only needs to land
-            # inside the text body; the Ctrl+Home right after resets the caret.
-            bx, by = int(editor_box.left), int(editor_box.top)
-            bh = int(editor_box.height)
-            focus_x = bx + 60
-            focus_y = by + bh + 100  # inside the text area, below the header
-            self.log("info", f"Clicking editor to lock focus at ({focus_x}, {focus_y}).")
-            pyautogui.click(focus_x, focus_y)
-            time.sleep(0.4)
+            header_present, body_present = self._read_clear_state(editor_box, expected_id)
 
-            # STEP 2: Go to end of the single header line, add ONE blank line.
-            # Modifier combos use _hold_combo so the modifier isn't dropped.
-            _hold_combo(["ctrl"], "home")     # to very top (start of header)
-            time.sleep(0.3)
-            pyautogui.press("end")            # end of header line (plain key, safe)
-            time.sleep(0.2)
-            pyautogui.press("enter")          # one blank line below the header
-            time.sleep(0.2)
-
-            # STEP 3: Select from here to the very end, then delete. Ctrl+Shift
-            # held down explicitly so neither modifier gets dropped (that was
-            # the bug: it degraded to plain End = no selection).
-            _hold_combo(["ctrl", "shift"], "end")
-            time.sleep(0.2)
-            pyautogui.press("delete")
-            time.sleep(0.4)
-
-        time.sleep(0.8)  # let RDP input settle after the OCR read loop
-        _do_delete_sequence()
-
-        if self._body_appears_cleared(editor_box):
-            self.log("success", "Template body cleared (verified).")
-        else:
-            self.log("warn",
-                     "Template body still present after delete - retrying the "
-                     "clear once (likely another dropped keystroke).")
-            _do_delete_sequence()
-            if not self._body_appears_cleared(editor_box):
-                self._save_timeout_screenshot("body_not_cleared")
+            if not header_present:
+                # We've deleted too far - into the header. Stop NOW and abort;
+                # a damaged bold header must never be saved.
+                self._save_timeout_screenshot("header_overshoot")
                 raise RuntimeError(
-                    "Could not clear the template body (the "
-                    f"'{self.clear_sentinel}' template line is still on screen "
-                    "after two attempts) - stopping rather than pasting the "
-                    "note under an un-deleted template. A screenshot was saved."
+                    f"Backspace clear overshot the header (patient ID "
+                    f"{expected_id} no longer visible) - aborting to avoid "
+                    "saving a damaged header. A screenshot was saved."
                 )
 
-    def _body_appears_cleared(self, editor_box):
-        """
-        Return True if the template body looks deleted - i.e. the sentinel
-        word from the BOTTOM of the template (default 'Educational', the last
-        template line) is no longer readable in the editor area.
+            if not body_present:
+                # Body gone, header intact - done.
+                self.log("success",
+                         f"Template body cleared via backspace after "
+                         f"{batch} batch(es), header intact.")
+                return
 
-        Checked BEFORE the note is pasted, so the ONLY possible source of the
-        sentinel is leftover template text. Reads a tall region so it reaches
-        the bottom of the template.
+            # Body still there - delete another batch of backspaces.
+            for _ in range(BATCH):
+                pyautogui.press("backspace")
+                time.sleep(0.03)
+            time.sleep(0.3)
+
+        # Ran out of batches without clearing - stop rather than continue.
+        self._save_timeout_screenshot("body_not_cleared")
+        raise RuntimeError(
+            "Could not clear the template body with backspace within the batch "
+            "limit - stopping rather than pasting under a partial template. "
+            "A screenshot was saved."
+        )
+
+    def _read_clear_state(self, editor_box, expected_id):
+        """
+        OCR the editor region once and report two booleans:
+          (header_present, body_present)
+
+        header_present: the expected patient ID digits are still visible (the
+                        bold header line is intact).
+        body_present:   the TOP-of-body sentinel (self.clear_sentinel,
+                        default 'Complaint') is still visible.
+
+        Direction matters: we delete BOTTOM-UP with backspace, so the bottom
+        template lines ('Educational', 'Medical', ...) disappear FIRST and
+        'Complaint' (the first body line) disappears LAST. Therefore the test
+        for "is the whole body gone?" must key on the TOP line 'Complaint' -
+        not the bottom line - otherwise the loop would declare success as soon
+        as 'Educational' vanished, leaving most of the template behind.
+
+        Used by the backspace-clear loop to decide: keep deleting, stop
+        (body gone), or abort (header gone = overshoot).
         """
         try:
             screen_w, screen_h = pyautogui.size()
             left = int(editor_box.left)
             top = int(editor_box.top) + int(editor_box.height)
             width = max(int(editor_box.width), 520)
-            height = 460  # tall enough to reach the bottom template line
+            height = 460  # tall enough to include header + full template body
 
             left = max(0, min(left, int(screen_w) - 1))
             top = max(0, min(top, int(screen_h) - 1))
@@ -624,12 +695,16 @@ class AutomationEngine:
             height = max(1, min(height, int(screen_h) - top))
 
             text = self._read_region_text(left, top, width, height)
-            return self.clear_sentinel.lower() not in text.lower()
+            digits = "".join(c for c in text if c.isdigit())
+            header_present = expected_id in digits
+            body_present = self.clear_sentinel.lower() in text.lower()
+            return header_present, body_present
         except Exception as exc:
-            # If we can't verify, treat as NOT cleared - safer to retry/abort
-            # than to assume success and paste into a mess.
-            self.log("error", f"Body-clear verify OCR error: {type(exc).__name__}: {exc}")
-            return False
+            # If OCR fails, report header MISSING + body PRESENT: the safest
+            # combination, because it makes the loop treat it as a potential
+            # overshoot and abort rather than keep backspacing blindly.
+            self.log("error", f"Clear-state OCR error: {type(exc).__name__}: {exc}")
+            return False, True
 
     # ---------------- per-patient pipeline ----------------
 
@@ -685,10 +760,16 @@ class AutomationEngine:
             label="patient record opened",
         )
         self._check_abort()
-        time.sleep(self.post_load_settle)  # dialog closing != patient data fully
-                                            # loaded over RDP - extra buffer here
-                                            # specifically to avoid landing on the
-                                            # PREVIOUS patient's still-displayed screen
+
+        # 3b. Wait until the DOCKED Progress Notes panel actually shows THIS
+        # patient's ID before doing anything. The "Administration no." field
+        # top-right updates EARLY (before the notes finish loading), so it is
+        # NOT a safe signal - checking it would let us proceed while the panel
+        # still shows the previous patient. The docked panel's own content is
+        # the real "fully loaded" signal, so we OCR that region and wait for
+        # the new ID. Replaces the old fixed post_load_settle guess.
+        self._wait_for_patient_in_notes_panel(record.patient_id)
+        self._check_abort()
 
         # 4. Ensure the right tab is active (usually already default)
         self._ensure_progress_tab()
@@ -735,13 +816,17 @@ class AutomationEngine:
         #   - after deleting, OCR-verify the template body actually cleared
         #     (sentinel word gone) before pasting; retry the delete once, then
         #     abort rather than paste into a half-cleared note.
-        self._clear_template_body(editor_box)
+        self._clear_template_body(editor_box, record.patient_id)
         self._check_abort()
 
-        # 7. Paste the clinical note. After the clear, the caret sits at the
-        # start of the now-empty first body line, directly below the header
-        # (the header was never selected, so it's untouched). Paste there.
-        pyperclip.copy(record.note_text)
+        # 7. Paste the clinical note. After the backspace-clear, the caret sits
+        # at the END of the header line (everything below was deleted). Press
+        # Enter (plain key - never dropped over RDP) to move to a fresh line
+        # below the header, then paste. The note is newline-prefixed too, as a
+        # belt-and-suspenders margin so it can never run onto the bold header.
+        pyautogui.press("enter")
+        time.sleep(0.2)
+        pyperclip.copy("\n" + record.note_text)
         pyautogui.hotkey("ctrl", "v")
         time.sleep(0.8)
         self._check_abort()
