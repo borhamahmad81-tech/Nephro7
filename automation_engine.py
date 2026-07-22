@@ -501,58 +501,49 @@ class AutomationEngine:
 
     def _clear_template_body(self, editor_box):
         """
-        Keep the single header line, delete the template body below it.
+        Keep the bold header line, delete the template body below it.
 
-        Sends the delete choreography with the dropped-first-keystroke guard
-        (Ctrl+Home twice + inter-key delays), then OCR-verifies the body
-        actually cleared before returning. If the template sentinel is still
-        present, retries the delete once; if it STILL isn't gone, raises so we
-        never paste into a half-cleared note (which is what produced the
-        "note appended under the intact template" result).
+        Method: PUSH the template down with Enter, then select-and-delete it -
+        rather than trying to precisely navigate TO the template first. This
+        avoids the two failure modes hit earlier:
+          - Down-counting drifted (miscounted lines -> landed at document end,
+            so select/delete hit nothing and backspaces damaged "Educational").
+          - Clicking required knowing the on-screen pixel offset to "Complaint",
+            which was a guess.
+
+        Sequence: Ctrl+Home (x2, drop-guard - this is the one genuinely risky
+        first keystroke) -> End (end of the SINGLE header line - unambiguous,
+        no counting) -> Enter, Enter (pushes the template down 2 lines,
+        leaving the caret 2 lines below the header - exactly where the note
+        should start, with one blank line preserved above it) -> Ctrl+Shift+End
+        (select everything from there to the true end - the old blank line +
+        the whole pushed-down template - confirmed working in this editor) ->
+        Delete.
+
+        Since it's the template being deleted anyway, pushing it down first
+        costs nothing - the header is never selected because End guarantees
+        the caret starts strictly after it.
+
+        Then OCR-verifies the body actually cleared; retries once; else raises
+        rather than paste into a half-cleared note.
         """
 
         def _do_delete_sequence():
-            # Proven manually: put the caret at the START of the first template
-            # line ("Complaint"), press Ctrl+Shift+End to select down to the
-            # very end, then Delete. Ctrl+Shift+End IS supported by this editor
-            # (confirmed on-screen) - the earlier failure was caret POSITION,
-            # not the keystroke.
-            #
-            # Getting to the start of "Complaint": Ctrl+Home to the very top
-            # (start of the bold header line), then Down TWICE - once past the
-            # header, once past the blank line - landing on "Complaint", then
-            # Home to guarantee start-of-line. Ctrl+Home is sent twice because
-            # over RDP the first keystroke after the editor opens can be
-            # dropped; repeating it is harmless (top stays top).
+            self._park_cursor_safe()
             pyautogui.hotkey("ctrl", "home")
             time.sleep(0.3)
-            pyautogui.hotkey("ctrl", "home")
+            pyautogui.hotkey("ctrl", "home")  # repeated: defeats a dropped first key
             time.sleep(0.3)
-            pyautogui.press("down")          # past the header line
+            pyautogui.press("end")            # end of the header line (only 1 line)
+            time.sleep(0.2)
+            pyautogui.press("enter")
             time.sleep(0.15)
-            pyautogui.press("down")          # past the blank line -> "Complaint"
-            time.sleep(0.15)
-            pyautogui.press("home")          # start of the "Complaint" line
-            time.sleep(0.15)
-            pyautogui.hotkey("ctrl", "shift", "end")  # select body to the end
+            pyautogui.press("enter")
+            time.sleep(0.2)
+            pyautogui.hotkey("ctrl", "shift", "end")  # select pushed-down template
             time.sleep(0.2)
             pyautogui.press("delete")
             time.sleep(0.4)
-            # After the delete, the first body line keeps an empty bullet, and
-            # there's a blank line between it and the header. Confirmed manually
-            # on this template: exactly TWO backspaces remove the empty bullet
-            # and the blank line, leaving the caret on its own empty line just
-            # below the bold header (verified it does NOT merge onto the header
-            # line). We send exactly two, with a small delay between them.
-            #
-            # Safety: even if a keystroke were mistimed, the note pasted next is
-            # prefixed with a newline (see paste step), so it always starts on a
-            # fresh line and cannot run onto the header text - which must stay
-            # exactly as the EMR made it.
-            pyautogui.press("backspace")
-            time.sleep(0.2)
-            pyautogui.press("backspace")
-            time.sleep(0.2)
 
         time.sleep(0.8)  # let RDP input settle after the OCR read loop
         _do_delete_sequence()
@@ -710,11 +701,10 @@ class AutomationEngine:
         self._clear_template_body(editor_box)
         self._check_abort()
 
-        # 7. Paste the clinical note. After the clear + 2 backspaces the caret
-        # sits on its own empty line below the header. Prefix the note with a
-        # newline as a safety margin so it always begins on a fresh line and
-        # can never run onto the bold header, even if a keystroke was mistimed.
-        pyperclip.copy("\n" + record.note_text)
+        # 7. Paste the clinical note. After the clear, the caret sits at the
+        # start of the now-empty first body line, directly below the header
+        # (the header was never selected, so it's untouched). Paste there.
+        pyperclip.copy(record.note_text)
         pyautogui.hotkey("ctrl", "v")
         time.sleep(0.8)
         self._check_abort()
