@@ -162,6 +162,14 @@ class AutomationEngine:
         before returning. Raises RuntimeError if it can't confirm - stopping
         rather than sending keystrokes into the void.
         """
+        # Park the cursor centre-screen BEFORE any pyautogui action in this
+        # whole per-patient cycle. The fail-safe fires on the NEXT pyautogui
+        # call if the cursor is sitting in a corner, so if the user left the
+        # mouse in a corner (or a previous step nudged it there) the very first
+        # click/press aborts. Doing this here, at the top of the cycle, covers
+        # everything downstream. SetCursorPos does not go through the fail-safe.
+        self._park_cursor_safe()
+
         try:
             import win32gui
             import win32con
@@ -229,20 +237,36 @@ class AutomationEngine:
         """
         import win32gui
 
-        try:
-            # Get the cursor out of any fail-safe corner FIRST, otherwise the
-            # click below can abort the whole run on its fail-safe check.
-            self._park_cursor_safe()
-            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
-            cx = (left + right) // 2
-            cy = top + 12  # title bar strip, not the window content - avoids
-                            # accidentally clicking a patient row/button inside
-            pyautogui.click(cx, cy)
-            time.sleep(0.2)
-            pyautogui.press("escape")  # clear any accidentally-activated menu
-            time.sleep(0.2)
-        except Exception as exc:
-            self.log("warn", f"Could not settle RDP input focus: {exc}")
+        for attempt in range(2):
+            try:
+                # Re-park the cursor centre-screen IMMEDIATELY before the click
+                # every attempt. The fail-safe checks the cursor position at the
+                # moment of the pyautogui call, so parking must be the last
+                # thing before it.
+                self._park_cursor_safe()
+                time.sleep(0.05)
+                left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+                cx = (left + right) // 2
+                # Click a point safely INSIDE the title bar strip, clamped away
+                # from the very top edge so the move can never read as a corner.
+                cy = max(top + 12, 8)
+                pyautogui.click(cx, cy)
+                time.sleep(0.2)
+                pyautogui.press("escape")  # clear any accidentally-opened menu
+                time.sleep(0.2)
+                return
+            except pyautogui.FailSafeException:
+                # The cursor was in a corner at the instant of the click. Park
+                # and retry once rather than abandoning focus settling (which
+                # would leave keystrokes going into the void).
+                self.log("warn",
+                         "Fail-safe tripped during focus settle - re-parking "
+                         "cursor and retrying once.")
+                self._park_cursor_safe()
+                time.sleep(0.2)
+            except Exception as exc:
+                self.log("warn", f"Could not settle RDP input focus: {exc}")
+                return
 
     # ---------------- image-based detection (inside the RDP session) ----------------
 
@@ -488,19 +512,47 @@ class AutomationEngine:
         """
 
         def _do_delete_sequence():
-            # Ctrl+Home TWICE: the first can be dropped by RDP right here, and
-            # repeating it is harmless (top stays top). This is the actual fix
-            # for the append-below-template bug.
+            # Proven manually: put the caret at the START of the first template
+            # line ("Complaint"), press Ctrl+Shift+End to select down to the
+            # very end, then Delete. Ctrl+Shift+End IS supported by this editor
+            # (confirmed on-screen) - the earlier failure was caret POSITION,
+            # not the keystroke.
+            #
+            # Getting to the start of "Complaint": Ctrl+Home to the very top
+            # (start of the bold header line), then Down TWICE - once past the
+            # header, once past the blank line - landing on "Complaint", then
+            # Home to guarantee start-of-line. Ctrl+Home is sent twice because
+            # over RDP the first keystroke after the editor opens can be
+            # dropped; repeating it is harmless (top stays top).
             pyautogui.hotkey("ctrl", "home")
             time.sleep(0.3)
             pyautogui.hotkey("ctrl", "home")
             time.sleep(0.3)
-            pyautogui.press("down")          # move off the header onto line 2
-            time.sleep(0.2)
+            pyautogui.press("down")          # past the header line
+            time.sleep(0.15)
+            pyautogui.press("down")          # past the blank line -> "Complaint"
+            time.sleep(0.15)
+            pyautogui.press("home")          # start of the "Complaint" line
+            time.sleep(0.15)
             pyautogui.hotkey("ctrl", "shift", "end")  # select body to the end
             time.sleep(0.2)
             pyautogui.press("delete")
             time.sleep(0.4)
+            # After the delete, the first body line keeps an empty bullet, and
+            # there's a blank line between it and the header. Confirmed manually
+            # on this template: exactly TWO backspaces remove the empty bullet
+            # and the blank line, leaving the caret on its own empty line just
+            # below the bold header (verified it does NOT merge onto the header
+            # line). We send exactly two, with a small delay between them.
+            #
+            # Safety: even if a keystroke were mistimed, the note pasted next is
+            # prefixed with a newline (see paste step), so it always starts on a
+            # fresh line and cannot run onto the header text - which must stay
+            # exactly as the EMR made it.
+            pyautogui.press("backspace")
+            time.sleep(0.2)
+            pyautogui.press("backspace")
+            time.sleep(0.2)
 
         time.sleep(0.8)  # let RDP input settle after the OCR read loop
         _do_delete_sequence()
@@ -585,8 +637,14 @@ class AutomationEngine:
             )
         self._check_abort()
 
-        # 2. Type ID, Enter to search, Enter to confirm/open result
-        pyautogui.typewrite(record.patient_id, interval=0.03)
+        # 2. Enter the ID via CLIPBOARD PASTE, not typing. Typed characters go
+        # through the RDP session's keyboard layout, which on this system can
+        # produce the wrong characters (e.g. Greek letters). Pasting sends the
+        # actual text and bypasses the layout entirely. Then Enter to search,
+        # Enter to confirm/open the result.
+        pyperclip.copy(record.patient_id)
+        pyautogui.hotkey("ctrl", "v")
+        time.sleep(0.3)
         pyautogui.press("enter")
         time.sleep(1.0)  # brief settle for the in-list search results
         pyautogui.press("enter")
@@ -652,12 +710,11 @@ class AutomationEngine:
         self._clear_template_body(editor_box)
         self._check_abort()
 
-        # 7. Paste the clinical note. After the clear, the caret sits at the
-        # start of the (now empty) line directly under the header. Add ONE
-        # blank line so the note isn't jammed against the header, then paste.
-        pyautogui.press("enter")
-        time.sleep(0.2)
-        pyperclip.copy(record.note_text)
+        # 7. Paste the clinical note. After the clear + 2 backspaces the caret
+        # sits on its own empty line below the header. Prefix the note with a
+        # newline as a safety margin so it always begins on a fresh line and
+        # can never run onto the bold header, even if a keystroke was mistimed.
+        pyperclip.copy("\n" + record.note_text)
         pyautogui.hotkey("ctrl", "v")
         time.sleep(0.8)
         self._check_abort()
@@ -677,9 +734,19 @@ class AutomationEngine:
             self._wait_while_paused()
             self._check_abort()
 
-        # 9. Type password, Enter to commit
-        pyautogui.typewrite(self.password, interval=0.02)
+        # 9. Enter the password via CLIPBOARD PASTE, not typing - same reason
+        # as the ID: typed characters can come out wrong (e.g. Greek) through
+        # the RDP keyboard layout, which would make every sign-off fail. Paste
+        # sends the exact characters. Then Enter to commit. Immediately clear
+        # the clipboard afterwards so the password doesn't linger there.
+        pyperclip.copy(self.password)
+        pyautogui.hotkey("ctrl", "v")
+        time.sleep(0.3)
         pyautogui.press("enter")
+        try:
+            pyperclip.copy("")  # clear the password out of the clipboard
+        except Exception:
+            pass
 
         # 10. Confirm the save actually committed (dialog disappears)
         self._wait_for_template(
