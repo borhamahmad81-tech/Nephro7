@@ -85,6 +85,16 @@ class AutomationEngine:
                                       # before doing anything patient-specific -
                                       # combats stale-previous-patient race condition
 
+        # Where within the matched new-note-icon template to click, as
+        # fractions of the matched box (0..1). The template includes the icon
+        # plus some panel title/tab, so the geometric centre may land on text
+        # instead of the icon. THIS crop is "PROGRESS NOTES" text on top with
+        # the icon in the BOTTOM portion, so we click low in the box. If the
+        # click lands slightly off the icon, nudge these: smaller y = higher,
+        # larger y = lower.
+        self.icon_click_x_frac = 0.50
+        self.icon_click_y_frac = 0.78
+
         # pygetwindow/win32gui used ONLY to verify the local RDP client window
         # has real OS focus - not used for anything happening inside the
         # remote session (see module docstring).
@@ -325,11 +335,22 @@ class AutomationEngine:
             label="progress-notes new-note icon (anchor visible)"
         )
         self._park_cursor_safe()
-        # The template is [icon][partial title]. The icon is at the LEFT edge
-        # of the matched box, so click the left portion, vertically centred,
-        # NOT the geometric centre (which could land on the title text).
-        click_x = box.left + max(8, box.width // 8)
-        click_y = box.top + box.height // 2
+        # The template crop is the new-note icon together with part of the
+        # PROGRESS NOTES panel title/tab (used so it only matches inside the
+        # Progress Notes panel, never the identical icon in Doctors Orders).
+        # The ICON is in the crop; the title/tab text is the rest. We must
+        # click the ICON, not the text. Which part of the box the icon sits in
+        # depends on how the crop was made, so both offsets are tunable:
+        #   icon_click_x_frac / icon_click_y_frac are fractions (0..1) of the
+        #   matched box width/height giving the click point.
+        # Default targets the upper-left region, where the icon sits when the
+        # crop is icon-above-title (tall, narrow box) or icon-left-of-title.
+        bx, by = int(box.left), int(box.top)
+        bw, bh = int(box.width), int(box.height)
+        click_x = bx + max(6, int(bw * self.icon_click_x_frac))
+        click_y = by + max(6, int(bh * self.icon_click_y_frac))
+        self.log("info", f"Clicking new-note icon at ({click_x}, {click_y}) "
+                         f"within match Box(left={bx}, top={by}, w={bw}, h={bh}).")
         pyautogui.click(click_x, click_y)
         time.sleep(0.4)
 
@@ -366,7 +387,8 @@ class AutomationEngine:
     def _read_region_text(self, left, top, width, height):
         import pytesseract
         self._configure_tesseract()
-        shot = pyautogui.screenshot(region=(left, top, width, height))
+        region = (int(left), int(top), int(width), int(height))
+        shot = pyautogui.screenshot(region=region)
         return pytesseract.image_to_string(shot)
 
     def _wait_for_correct_patient_header(self, expected_id, editor_box, timeout=None):
@@ -382,10 +404,30 @@ class AutomationEngine:
         if timeout is None:
             timeout = self.patient_load_timeout
 
-        left = editor_box.left
-        top = editor_box.top + 120   # header line sits below the toolbar/ribbon
-        width = max(editor_box.width, 480)
-        height = 40
+        # editor_box coordinates come back from pyautogui as numpy int64, which
+        # pyautogui.screenshot(region=...) rejects ("must be a tuple of four
+        # ints"). Coerce to plain Python ints.
+        #
+        # The region is anchored to the matched PROGRESS NOTES template. Rather
+        # than a single fragile pixel offset to one 40px line (which breaks if
+        # the template is recaptured from a different part of the window), scan
+        # a GENEROUS band covering the whole area where the patient header can
+        # appear - from just below the matched template down ~260px, and wider
+        # than the template so the full "Lastname, Firstname (ID) [.. Y].."
+        # line is captured. OCR-ing a bigger band and searching it for the ID
+        # is more robust than pixel-perfect targeting.
+        screen_w, screen_h = pyautogui.size()
+
+        left = int(editor_box.left)
+        top = int(editor_box.top) + int(editor_box.height)  # start just below match
+        width = max(int(editor_box.width), 520)
+        height = 260
+
+        # Clamp to screen bounds so the region is always valid.
+        left = max(0, min(left, int(screen_w) - 1))
+        top = max(0, min(top, int(screen_h) - 1))
+        width = max(1, min(width, int(screen_w) - left))
+        height = max(1, min(height, int(screen_h) - top))
 
         deadline = time.time() + timeout
         last_text = ""
@@ -397,16 +439,31 @@ class AutomationEngine:
                 self.log("error", f"OCR error: {type(exc).__name__}: {exc}")
                 last_text = ""
 
-            if expected_id in last_text:
+            if self._id_in_text(expected_id, last_text):
                 return
 
             time.sleep(0.5)
 
         raise RuntimeError(
             f"Could not confirm patient ID {expected_id} in the note header "
-            f"within {timeout}s (last OCR read: '{last_text.strip()[:60]}') - "
+            f"within {timeout}s (last OCR read: '{last_text.strip()[:80]}') - "
             "stopping rather than risk pasting into the wrong patient's chart."
         )
+
+    @staticmethod
+    def _id_in_text(expected_id, text):
+        """
+        Match the patient ID against OCR output tolerantly. Tesseract often
+        injects spaces inside long digit runs and mangles a char or two, so a
+        raw `expected_id in text` substring test throws false negatives. We
+        strip every non-digit from BOTH sides and check the clean ID appears
+        as a digit-substring. This keeps the safety property (must actually
+        see the right ID) while not aborting on cosmetic OCR noise.
+        """
+        if not text:
+            return False
+        digits = "".join(c for c in text if c.isdigit())
+        return expected_id in digits
 
     # ---------------- per-patient pipeline ----------------
 
