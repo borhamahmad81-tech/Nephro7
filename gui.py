@@ -228,12 +228,33 @@ class MedvisionApp:
             messagebox.showwarning("No password", "Please enter the signature password.")
             return
 
+        # Required templates must ALWAYS be present - a run cannot detect
+        # dialog states or find the new-note icon without them. This check
+        # used to only run when the tab checkbox was unticked, so you could
+        # start a run with all required templates missing and only find out
+        # ~30s in. Block hard on missing required templates.
+        missing_required = [
+            n for n, ok in self.engine.check_required_assets().items() if not ok
+        ]
+        if missing_required:
+            messagebox.showerror(
+                "Missing required template(s)",
+                "These required template images are missing - cannot start:\n"
+                + "\n".join(missing_required)
+                + "\n\nCapture them from your live screen and place them in the "
+                "same folder.",
+            )
+            return
+
+        # The tab template is an optional fallback, only needed when the tab
+        # isn't default-active. Warn but allow continuing.
         if not self.tab_active_var.get():
-            missing = [n for n, ok in self.engine.check_assets().items() if not ok]
-            if missing:
+            from automation_engine import TEMPLATE_PROGRESS_TAB
+            import os
+            if not os.path.isfile(self.engine._asset(TEMPLATE_PROGRESS_TAB)):
                 if not messagebox.askyesno(
                     "Missing fallback image",
-                    f"{len(missing)} fallback image(s) missing:\n" + "\n".join(missing)
+                    f"Optional fallback image missing:\n{TEMPLATE_PROGRESS_TAB}"
                     + "\n\nContinue anyway?",
                 ):
                     return
@@ -300,10 +321,30 @@ class MedvisionApp:
                 win.destroy()
                 self.engine.resume()
 
+            def cancel():
+                # Closing the popup with the window X (or an explicit Abort)
+                # must NOT leave the worker paused forever. Treat it as abort:
+                # the engine is waiting in _wait_while_paused, which only exits
+                # on resume() or abort. Without this, clicking X hangs the run.
+                win.destroy()
+                self._log("warn", "Sign popup closed without confirming - aborting run.")
+                self.engine.request_abort()
+                self.abort_btn.config(state="disabled")
+                self.status_label.config(text="Aborting...")
+
+            # Route the window-manager close button (X) to cancel/abort.
+            win.protocol("WM_DELETE_WINDOW", cancel)
+
+            btn_row = ttk.Frame(win, style="Panel.TFrame")
+            btn_row.pack(pady=(0, 15))
             tk.Button(
-                win, text="Continue", bg=GREEN, fg="black",
+                btn_row, text="Continue", bg=GREEN, fg="black",
                 font=("Segoe UI", 10, "bold"), command=confirm
-            ).pack(pady=(0, 15))
+            ).pack(side="left", padx=6)
+            tk.Button(
+                btn_row, text="Abort", bg=RED, fg="white",
+                font=("Segoe UI", 10, "bold"), command=cancel
+            ).pack(side="left", padx=6)
 
         self.root.after(0, show_popup)
 

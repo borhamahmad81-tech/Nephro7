@@ -20,6 +20,7 @@ TEMPLATES = [
     "search_patients_dialog.png",
     "progress_notes_editor.png",
     "verification_dialog.png",
+    "new_note_icon.png",
 ]
 
 

@@ -20,6 +20,15 @@ Required template images (in the same folder as this script):
   search_patients_dialog.png   - crop of the "Search patients" title bar
   progress_notes_editor.png    - crop of the "PROGRESS NOTES" editor title bar
   verification_dialog.png      - crop of the "Verification..." dialog title bar
+  new_note_icon.png            - crop of the new-note (blank page) icon TOGETHER
+                                 with part of the "PROGRESS NOTES" panel title,
+                                 so it matches ONLY inside the Progress Notes
+                                 panel and NOT the identical icon in Doctors
+                                 Orders. This is clicked to open a new note
+                                 instead of pressing Ctrl+Insert, because the
+                                 keystroke depends on which pane has focus
+                                 (it also fires in Doctors Orders) whereas a
+                                 located icon click is focus-independent.
   doctors_progress_tab.png     - optional, only if the tab isn't default-active
 """
 
@@ -33,14 +42,18 @@ pyautogui.FAILSAFE = True
 TEMPLATE_SEARCH_PATIENTS = "search_patients_dialog.png"
 TEMPLATE_PROGRESS_NOTES = "progress_notes_editor.png"
 TEMPLATE_VERIFICATION = "verification_dialog.png"
+TEMPLATE_NEW_NOTE_ICON = "new_note_icon.png"  # icon + panel-title anchor
 TEMPLATE_PROGRESS_TAB = "doctors_progress_tab.png"  # optional fallback only
 
-IMAGE_ASSETS = [
+# Required templates that MUST exist for a run to be safe.
+REQUIRED_ASSETS = [
     TEMPLATE_SEARCH_PATIENTS,
     TEMPLATE_PROGRESS_NOTES,
     TEMPLATE_VERIFICATION,
-    TEMPLATE_PROGRESS_TAB,
+    TEMPLATE_NEW_NOTE_ICON,
 ]
+
+IMAGE_ASSETS = REQUIRED_ASSETS + [TEMPLATE_PROGRESS_TAB]
 
 
 class AbortRequested(Exception):
@@ -95,6 +108,30 @@ class AutomationEngine:
     def _asset(self, filename):
         import os
         return os.path.join(self.image_dir, filename)
+
+    def _park_cursor_safe(self):
+        """
+        Move the cursor away from the screen corners before doing anything.
+
+        PyAutoGUI's FAILSAFE treats "mouse in a corner" as a panic/abort
+        signal and raises on the NEXT pyautogui action. If the user leaves
+        the cursor parked in a corner when a run starts, the very first
+        click aborts instantly (this is exactly what bit us in the field).
+
+        We use win32api.SetCursorPos (NOT pyautogui.moveTo) so this move
+        itself does not go through the fail-safe check and cannot abort.
+        Parking roughly centre-screen keeps the real fail-safe intact as a
+        manual kill switch (user slams mouse into a corner to stop), while
+        preventing accidental self-triggering at the start of each action.
+        """
+        try:
+            import win32api
+            w, h = pyautogui.size()
+            win32api.SetCursorPos((w // 2, h // 2))
+        except Exception as exc:
+            # Non-fatal: if this fails we simply proceed and let the normal
+            # fail-safe behaviour stand.
+            self.log("warn", f"Could not park cursor centre-screen: {exc}")
 
     # ---------------- local RDP-client focus verification ----------------
 
@@ -173,6 +210,9 @@ class AutomationEngine:
         import win32gui
 
         try:
+            # Get the cursor out of any fail-safe corner FIRST, otherwise the
+            # click below can abort the whole run on its fail-safe check.
+            self._park_cursor_safe()
             left, top, right, bottom = win32gui.GetWindowRect(hwnd)
             cx = (left + right) // 2
             cy = top + 12  # title bar strip, not the window content - avoids
@@ -217,14 +257,34 @@ class AutomationEngine:
             time.sleep(self.poll_interval)
 
         verb = "appear" if should_appear else "disappear"
+        shot_path = self._save_timeout_screenshot(label or template_filename)
         raise RuntimeError(
             f"'{template_filename}' never seemed to {verb}"
             + (f" ({label})" if label else "")
             + f" within {timeout}s - stopping rather than guessing the app is done. "
-            "If this keeps happening even though the step clearly worked on screen, "
+            + (f"Saved a screenshot of what was on screen to: {shot_path}. " if shot_path else "")
+            + "If this keeps happening even though the step clearly worked on screen, "
             "the template image likely doesn't match your actual resolution/zoom - "
             "recapture it directly from your live screen."
         )
+
+    def _save_timeout_screenshot(self, label):
+        """
+        Dump a full-screen screenshot to disk whenever a detection step times
+        out, so a failed run comes back with a picture of what was actually
+        on screen instead of a guess. Returns the path, or None on failure.
+        """
+        import os
+        try:
+            safe = "".join(c if c.isalnum() else "_" for c in label)[:40]
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(self.image_dir, f"timeout_{safe}_{stamp}.png")
+            pyautogui.screenshot().save(path)
+            self.log("warn", f"Saved timeout screenshot: {path}")
+            return path
+        except Exception as exc:
+            self.log("warn", f"Could not save timeout screenshot: {exc}")
+            return None
 
     def _ensure_progress_tab(self):
         if self.assume_progress_tab_active:
@@ -236,9 +296,50 @@ class AutomationEngine:
         else:
             self.log("warn", "Progress Notes tab image not found - assuming it's already active.")
 
+    def _click_new_note_icon(self, timeout):
+        """
+        Open a new progress note by CLICKING the new-note icon, rather than
+        pressing Ctrl+Insert.
+
+        Why not Ctrl+Insert: that keystroke goes to whichever pane currently
+        has keyboard focus. Over RDP, right after a focus switch, that pane
+        is not reliably the Progress Notes panel - the identical shortcut
+        also creates a new entry in Doctors Orders if Orders has focus. So
+        the keystroke "works sometimes" depending on the last click. Clicking
+        a located on-screen icon does not depend on focus at all.
+
+        Why the template is icon + panel-title: the same blank-page icon
+        appears in BOTH the Progress Notes panel and Doctors Orders. Matching
+        the icon ALONE could click the Orders one (locateOnScreen returns the
+        first match in scan order). The template therefore includes part of
+        the unique "PROGRESS NOTES" panel title next to the icon, so it only
+        matches inside the Progress Notes panel.
+
+        This also doubles as an OBSTRUCTION GUARD: if the anchored icon is not
+        visible, either the Progress Notes panel is covered by another window
+        or Nephro is not really on top. In that case we STOP rather than click
+        blind - a blind click here could land anywhere.
+        """
+        box = self._wait_for_template(
+            TEMPLATE_NEW_NOTE_ICON, True, timeout,
+            label="progress-notes new-note icon (anchor visible)"
+        )
+        self._park_cursor_safe()
+        # The template is [icon][partial title]. The icon is at the LEFT edge
+        # of the matched box, so click the left portion, vertically centred,
+        # NOT the geometric centre (which could land on the title text).
+        click_x = box.left + max(8, box.width // 8)
+        click_y = box.top + box.height // 2
+        pyautogui.click(click_x, click_y)
+        time.sleep(0.4)
+
     def check_assets(self):
         import os
         return {name: os.path.isfile(self._asset(name)) for name in IMAGE_ASSETS}
+
+    def check_required_assets(self):
+        import os
+        return {name: os.path.isfile(self._asset(name)) for name in REQUIRED_ASSETS}
 
     # ---------------- OCR-based patient ID verification ----------------
 
@@ -364,10 +465,17 @@ class AutomationEngine:
         self._ensure_progress_tab()
         self._check_abort()
 
-        # 5. New Progress Note entry - single generous wait, NO retry: unlike
-        # F3 (safe to press twice), pressing Ctrl+Insert again if the first
-        # press just worked slowly could create a duplicate blank note.
-        pyautogui.hotkey("ctrl", "insert")
+        # 5. New Progress Note entry - CLICK the new-note icon anchored to the
+        # Progress Notes panel, NOT Ctrl+Insert. The keystroke depends on which
+        # pane has focus (it also fires in Doctors Orders) so it "worked
+        # sometimes"; the anchored click is focus-independent and Orders-safe.
+        # This also acts as an obstruction guard: if the anchored icon isn't
+        # visible (panel covered / Nephro not on top), it stops instead of
+        # clicking blind. No retry needed - a located click is idempotent in a
+        # way a blind keystroke was not, so the old duplicate-note risk is gone.
+        self._click_new_note_icon(self.note_editor_timeout)
+
+        # Confirm the floating PROGRESS NOTES editor modal actually opened.
         editor_box = self._wait_for_template(
             TEMPLATE_PROGRESS_NOTES, True, self.note_editor_timeout,
             label="note editor opened"
