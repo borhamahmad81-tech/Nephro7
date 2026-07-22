@@ -14,6 +14,7 @@ already open on screen, then read the printed results.
 """
 
 import sys
+import time
 import pyautogui
 
 TEMPLATES = [
@@ -22,6 +23,38 @@ TEMPLATES = [
     "verification_dialog.png",
     "new_note_icon.png",
 ]
+
+
+def _minimize_self_console():
+    """
+    Minimize THIS console window automatically. Windows activates whatever
+    window was on top before this one when it's minimized - normally the
+    Nephro window the user had open right before double-clicking this EXE.
+    This replaces relying on the user to Alt+Tab within a countdown, which
+    is exactly the kind of manual-timing step this project keeps hitting
+    problems with.
+    """
+    try:
+        import ctypes
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            SW_MINIMIZE = 6
+            ctypes.windll.user32.ShowWindow(hwnd, SW_MINIMIZE)
+    except Exception:
+        pass  # non-fatal - falls back to whatever is currently on screen
+
+
+def _restore_self_console():
+    """Bring this console window back so the results can be read."""
+    try:
+        import ctypes
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            SW_RESTORE = 9
+            ctypes.windll.user32.ShowWindow(hwnd, SW_RESTORE)
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
 
 
 def test_ocr():
@@ -52,7 +85,20 @@ def test_ocr():
 
 
 def main():
+    print("=== Nephro detection self-test ===")
+    print()
+    print("This window will minimize itself automatically in a couple of")
+    print("seconds so the window it's covering (expected: Nephro) is what")
+    print("gets captured - not this console window. It restores itself when")
+    print("done. You don't need to Alt+Tab or click anything.")
+    print()
+    time.sleep(2)
+
+    _minimize_self_console()
+    time.sleep(1.5)  # let Windows finish activating whatever is now on top
+
     test_ocr()
+
     print("=== Step 1: checking if image matching works at all ===")
     try:
         import cv2
@@ -64,7 +110,6 @@ def main():
 
     print()
     print("=== Step 2: testing each template against the CURRENT screen ===")
-    print("(make sure the relevant Nephro window is visible on screen right now)")
     print()
 
     for template in TEMPLATES:
@@ -82,8 +127,20 @@ def main():
     print()
     print("Also saving a full screenshot as detection_screen.png for reference.")
     pyautogui.screenshot().save("detection_screen.png")
-    print("Done.")
+
+    _restore_self_console()
+
+    print()
+    print("Done - this window restored itself. Results are above.")
+    print()
+    input("Press Enter to close this window...")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        _restore_self_console()
+        print()
+        print(f"CRASHED: {type(exc).__name__}: {exc}")
+        input("Press Enter to close this window...")
