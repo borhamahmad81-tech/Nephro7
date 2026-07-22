@@ -530,17 +530,34 @@ class AutomationEngine:
 
         def _do_delete_sequence():
             self._park_cursor_safe()
-            pyautogui.hotkey("ctrl", "home")
+
+            # STEP 1: Click into the editor text area to LOCK INPUT FOCUS. This
+            # is the crucial fix - the manual steps that work 100% of the time
+            # always start with a click. Firing keys "cold" lets RDP drop the
+            # first Ctrl (focus not live yet), so Ctrl+Shift+End degraded to
+            # Shift+End and selected/deleted nothing. The click only needs to
+            # land somewhere inside the editor body; Ctrl+Home right after
+            # resets the caret to a known position regardless of where it hit.
+            # Anchored to the matched editor template so it tracks the window.
+            bx, by = int(editor_box.left), int(editor_box.top)
+            bh = int(editor_box.height)
+            focus_x = bx + 60
+            focus_y = by + bh + 100  # inside the text area, below the header
+            self.log("info", f"Clicking editor to lock focus at ({focus_x}, {focus_y}).")
+            pyautogui.click(focus_x, focus_y)
             time.sleep(0.3)
-            pyautogui.hotkey("ctrl", "home")  # repeated: defeats a dropped first key
+
+            # STEP 2: With focus now live, position at end of the single header
+            # line and add ONE blank line below it.
+            pyautogui.hotkey("ctrl", "home")
             time.sleep(0.3)
             pyautogui.press("end")            # end of the header line (only 1 line)
             time.sleep(0.2)
-            pyautogui.press("enter")
-            time.sleep(0.15)
-            pyautogui.press("enter")
+            pyautogui.press("enter")          # one blank line below the header
             time.sleep(0.2)
-            pyautogui.hotkey("ctrl", "shift", "end")  # select pushed-down template
+
+            # STEP 3: Select everything from here to the end and delete it.
+            pyautogui.hotkey("ctrl", "shift", "end")
             time.sleep(0.2)
             pyautogui.press("delete")
             time.sleep(0.4)
