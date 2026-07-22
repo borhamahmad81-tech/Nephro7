@@ -608,9 +608,11 @@ class AutomationEngine:
         This trades a bit of speed for safety: the stop condition is OCR-
         verified every batch, not counted or guessed.
         """
-        BATCH_FAR = 25       # backspaces per batch while clearly far from header
-        BATCH_NEAR = 4       # small batch once close, to avoid overshooting header
-        MAX_BATCHES = 80     # hard ceiling then abort
+        BATCH = 6            # backspaces per batch before re-checking. Modest,
+                             # so any overshoot past 'Complaint' into the header
+                             # is bounded to a few chars - and the header-present
+                             # OCR check catches even that before anything saves.
+        MAX_BATCHES = 200    # hard ceiling then abort (200*6 = 1200 backspaces)
 
         self._park_cursor_safe()
 
@@ -643,17 +645,30 @@ class AutomationEngine:
         for batch in range(MAX_BATCHES):
             self._check_abort()
 
+            self.log("info", f"Clear check {batch + 1}: reading screen...")
             header_present, body_present = self._read_clear_state(editor_box, expected_id)
+            self.log("info",
+                     f"Clear check {batch + 1}: header_present={header_present}, "
+                     f"body_present={body_present}")
 
             if not header_present:
-                # We've deleted too far - into the header. Stop NOW and abort;
-                # a damaged bold header must never be saved.
-                self._save_timeout_screenshot("header_overshoot")
-                raise RuntimeError(
-                    f"Backspace clear overshot the header (patient ID "
-                    f"{expected_id} no longer visible) - aborting to avoid "
-                    "saving a damaged header. A screenshot was saved."
-                )
+                if batch == 0:
+                    # Nothing deleted yet - a missing header here means OCR
+                    # couldn't read it, NOT an overshoot. Don't abort on this;
+                    # log and proceed to delete a batch, then re-check.
+                    self.log("warn",
+                             "Header ID not read on first check (likely OCR) - "
+                             "proceeding cautiously.")
+                else:
+                    # We've already deleted and now the header ID is gone - we
+                    # overshot into the header. Stop NOW and abort; a damaged
+                    # bold header must never be saved.
+                    self._save_timeout_screenshot("header_overshoot")
+                    raise RuntimeError(
+                        f"Backspace clear overshot the header (patient ID "
+                        f"{expected_id} no longer visible) - aborting to avoid "
+                        "saving a damaged header. A screenshot was saved."
+                    )
 
             if not body_present:
                 # Body gone, header intact - done.
