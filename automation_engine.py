@@ -95,6 +95,16 @@ class AutomationEngine:
         self.icon_click_x_frac = 0.50
         self.icon_click_y_frac = 0.78
 
+        # Sentinel word used to confirm the template body was actually deleted
+        # before pasting. It must be a word that appears at/near the BOTTOM of
+        # the template (so if it's gone, the whole body from top to bottom is
+        # gone) and does NOT appear in the one-line patient header. The user's
+        # template runs "from Complaint ... to Educational", so 'Educational'
+        # (the last template line) is the default. Checked BEFORE paste, so a
+        # note that happens to contain the word later cannot cause a false
+        # positive.
+        self.clear_sentinel = "Educational"
+
         # pygetwindow/win32gui used ONLY to verify the local RDP client window
         # has real OS focus - not used for anything happening inside the
         # remote session (see module docstring).
@@ -465,6 +475,82 @@ class AutomationEngine:
         digits = "".join(c for c in text if c.isdigit())
         return expected_id in digits
 
+    def _clear_template_body(self, editor_box):
+        """
+        Keep the single header line, delete the template body below it.
+
+        Sends the delete choreography with the dropped-first-keystroke guard
+        (Ctrl+Home twice + inter-key delays), then OCR-verifies the body
+        actually cleared before returning. If the template sentinel is still
+        present, retries the delete once; if it STILL isn't gone, raises so we
+        never paste into a half-cleared note (which is what produced the
+        "note appended under the intact template" result).
+        """
+
+        def _do_delete_sequence():
+            # Ctrl+Home TWICE: the first can be dropped by RDP right here, and
+            # repeating it is harmless (top stays top). This is the actual fix
+            # for the append-below-template bug.
+            pyautogui.hotkey("ctrl", "home")
+            time.sleep(0.3)
+            pyautogui.hotkey("ctrl", "home")
+            time.sleep(0.3)
+            pyautogui.press("down")          # move off the header onto line 2
+            time.sleep(0.2)
+            pyautogui.hotkey("ctrl", "shift", "end")  # select body to the end
+            time.sleep(0.2)
+            pyautogui.press("delete")
+            time.sleep(0.4)
+
+        time.sleep(0.8)  # let RDP input settle after the OCR read loop
+        _do_delete_sequence()
+
+        if self._body_appears_cleared(editor_box):
+            self.log("success", "Template body cleared (verified).")
+        else:
+            self.log("warn",
+                     "Template body still present after delete - retrying the "
+                     "clear once (likely another dropped keystroke).")
+            _do_delete_sequence()
+            if not self._body_appears_cleared(editor_box):
+                self._save_timeout_screenshot("body_not_cleared")
+                raise RuntimeError(
+                    "Could not clear the template body (the "
+                    f"'{self.clear_sentinel}' template line is still on screen "
+                    "after two attempts) - stopping rather than pasting the "
+                    "note under an un-deleted template. A screenshot was saved."
+                )
+
+    def _body_appears_cleared(self, editor_box):
+        """
+        Return True if the template body looks deleted - i.e. the sentinel
+        word from the BOTTOM of the template (default 'Educational', the last
+        template line) is no longer readable in the editor area.
+
+        Checked BEFORE the note is pasted, so the ONLY possible source of the
+        sentinel is leftover template text. Reads a tall region so it reaches
+        the bottom of the template.
+        """
+        try:
+            screen_w, screen_h = pyautogui.size()
+            left = int(editor_box.left)
+            top = int(editor_box.top) + int(editor_box.height)
+            width = max(int(editor_box.width), 520)
+            height = 460  # tall enough to reach the bottom template line
+
+            left = max(0, min(left, int(screen_w) - 1))
+            top = max(0, min(top, int(screen_h) - 1))
+            width = max(1, min(width, int(screen_w) - left))
+            height = max(1, min(height, int(screen_h) - top))
+
+            text = self._read_region_text(left, top, width, height)
+            return self.clear_sentinel.lower() not in text.lower()
+        except Exception as exc:
+            # If we can't verify, treat as NOT cleared - safer to retry/abort
+            # than to assume success and paste into a mess.
+            self.log("error", f"Body-clear verify OCR error: {type(exc).__name__}: {exc}")
+            return False
+
     # ---------------- per-patient pipeline ----------------
 
     def process_patient(self, record):
@@ -547,16 +633,30 @@ class AutomationEngine:
         self._wait_for_correct_patient_header(record.patient_id, editor_box)
         self._check_abort()
 
-        # 6. Keep header line, clear the template body below it
-        pyautogui.hotkey("ctrl", "home")
-        pyautogui.press("down")
-        pyautogui.hotkey("ctrl", "shift", "end")
-        pyautogui.press("delete")
-        pyautogui.press("enter")
-        pyautogui.press("enter")
+        # 6. Keep the header line (exactly one line), clear the template body
+        # below it, THEN paste - so the note replaces the template instead of
+        # being appended under it.
+        #
+        # Root cause of the earlier "note appended below intact template" bug:
+        # over RDP the FIRST keystroke after the OCR read loop gets dropped
+        # (the same dropped-first-keystroke issue F3 already guards against).
+        # The dropped key was Ctrl+Home, so the caret never went to the top;
+        # the selection/delete then did nothing while the later paste still
+        # landed - appending. Guards below:
+        #   - settle after the OCR loop,
+        #   - Ctrl+Home sent TWICE (harmless to repeat; defeats the drop),
+        #   - small delays between keys so RDP doesn't coalesce/drop them,
+        #   - after deleting, OCR-verify the template body actually cleared
+        #     (sentinel word gone) before pasting; retry the delete once, then
+        #     abort rather than paste into a half-cleared note.
+        self._clear_template_body(editor_box)
         self._check_abort()
 
-        # 7. Paste the clinical note
+        # 7. Paste the clinical note. After the clear, the caret sits at the
+        # start of the (now empty) line directly under the header. Add ONE
+        # blank line so the note isn't jammed against the header, then paste.
+        pyautogui.press("enter")
+        time.sleep(0.2)
         pyperclip.copy(record.note_text)
         pyautogui.hotkey("ctrl", "v")
         time.sleep(0.8)
