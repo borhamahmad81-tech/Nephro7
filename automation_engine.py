@@ -675,10 +675,25 @@ class AutomationEngine:
         pyautogui.hotkey("ctrl", "v")
         time.sleep(1.0)
 
+        # Scroll back to the TOP before verifying. After pasting a long note
+        # the editor view scrolls to the bottom (the caret ends at the end of
+        # the pasted text), so the header line is no longer on screen and OCR
+        # cannot see the patient ID - which made verification fail even though
+        # the paste had worked perfectly. Ctrl+Home is a single-modifier combo,
+        # the class that does work through this pipeline.
+        pyautogui.keyDown("ctrl")
+        time.sleep(MOD_DELAY)
+        pyautogui.keyDown("home")
+        time.sleep(MOD_DELAY)
+        pyautogui.keyUp("home")
+        time.sleep(MOD_DELAY)
+        pyautogui.keyUp("ctrl")
+        time.sleep(0.6)  # let the view finish scrolling before reading
+
         # Verify the paste actually landed and shows this patient.
         header_present, _ = self._read_clear_state(editor_box, record.patient_id)
         if not header_present:
-            time.sleep(0.5)
+            time.sleep(0.6)
             header_present, _ = self._read_clear_state(editor_box, record.patient_id)
         if not header_present:
             self._save_timeout_screenshot("paste_not_verified")
@@ -931,15 +946,47 @@ class AutomationEngine:
             self._wait_while_paused()
             self._check_abort()
 
-        # 9. Enter the password via CLIPBOARD PASTE, not typing - same reason
-        # as the ID: typed characters can come out wrong (e.g. Greek) through
-        # the RDP keyboard layout, which would make every sign-off fail. Paste
-        # sends the exact characters. Then Enter to commit. Immediately clear
-        # the clipboard afterwards so the password doesn't linger there.
+            # CRITICAL: the guided popup is a window of OUR OWN GUI. While it
+            # was up, and after the user clicks Continue, keyboard focus is on
+            # the GUI - NOT on Nephro. Without re-focusing here, the password
+            # below would be typed/pasted into the wrong window entirely.
+            self.log("info", "Re-focusing Nephro after the guided pause...")
+            self._focus_nephro_window()
+            time.sleep(0.8)
+            self._check_abort()
+
+            # Re-confirm the verification dialog is still the thing on screen
+            # before sending credentials into it.
+            self._wait_for_template(
+                TEMPLATE_VERIFICATION, True, self.verify_open_timeout,
+                label="verification dialog still open after guided pause"
+            )
+            self._check_abort()
+
+        # 9. Enter the password.
+        #
+        # Pasting is preferred (typed characters can come out wrong through
+        # this RDP session's keyboard layout - the Greek-letter problem). But
+        # some password fields BLOCK paste entirely, in which case Ctrl+V does
+        # nothing and the sign-off silently fails. So: paste, press Enter, and
+        # if the dialog is still open shortly after, fall back to TYPING the
+        # password and pressing Enter again. Self-correcting, no guessing.
+        self.log("info", "Entering signature password (paste attempt)...")
         pyperclip.copy(self.password)
         pyautogui.hotkey("ctrl", "v")
-        time.sleep(0.3)
+        time.sleep(0.4)
         pyautogui.press("enter")
+        time.sleep(1.5)
+
+        if self._find_on_screen(TEMPLATE_VERIFICATION) is not None:
+            self.log("warn",
+                     "Verification dialog still open after paste+Enter - the "
+                     "password field may block pasting. Retrying by typing it.")
+            pyautogui.typewrite(self.password, interval=0.05)
+            time.sleep(0.4)
+            pyautogui.press("enter")
+            time.sleep(1.0)
+
         try:
             pyperclip.copy("")  # clear the password out of the clipboard
         except Exception:
