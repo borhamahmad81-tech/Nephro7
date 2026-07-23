@@ -117,6 +117,22 @@ class AutomationEngine:
         # misses the text, adjust: larger = lower.
         self.editor_click_dy = 190
 
+        # Vertical offset (pixels) from the TOP of the matched PROGRESS NOTES
+        # tab template down to the start of the editor's TEXT AREA - i.e. past
+        # the toolbar, the Date/Time/Doctor row, the format row and the ruler.
+        #
+        # This exists because OCR checks were previously reading from just
+        # below the matched tab, which is the TOOLBAR: they always picked up
+        # ~26 characters of "Date 07/23/2026 Time ... Doctor" text, so the
+        # "is the editor empty?" check could never return True even when the
+        # note was genuinely blank - and the run aborted before pasting.
+        #
+        # Calibrated against the live layout: ruler sits ~117px below the tab
+        # top, first line of text ~137px. 130 clears the ruler and starts just
+        # above the first text line. If OCR ever reads toolbar text again,
+        # increase this; if it misses the first line of the note, decrease it.
+        self.text_area_dy = 130
+
         # pygetwindow/win32gui used ONLY to verify the local RDP client window
         # has real OS focus - not used for anything happening inside the
         # remote session (see module docstring).
@@ -676,6 +692,35 @@ class AutomationEngine:
                  f"Header + note pasted and verified for patient "
                  f"{record.patient_id}.")
 
+    def _text_area_region(self, editor_box):
+        """
+        Return (left, top, width, height) for the editor's TEXT AREA only -
+        excluding the toolbar above it.
+
+        This fixes a real bug: the region used to start at
+        editor_box.top + editor_box.height, i.e. immediately below the matched
+        PROGRESS NOTES tab template - which lands on the TOOLBAR (the
+        "Date / Time / Doctor" row). OCR therefore always read about 26
+        characters of toolbar text, so the "is the editor empty?" check could
+        never return True even when the note was completely blank, and the run
+        aborted before pasting.
+
+        We now offset down by self.text_area_dy, which is measured to clear the
+        toolbar/format/ruler rows and start at the first line of actual text.
+        """
+        screen_w, screen_h = pyautogui.size()
+
+        left = int(editor_box.left)
+        top = int(editor_box.top) + int(self.text_area_dy)
+        width = max(int(editor_box.width), 520)
+        height = 420
+
+        left = max(0, min(left, int(screen_w) - 1))
+        top = max(0, min(top, int(screen_h) - 1))
+        width = max(1, min(width, int(screen_w) - left))
+        height = max(1, min(height, int(screen_h) - top))
+        return left, top, width, height
+
     def _editor_appears_empty(self, editor_box):
         """
         True if the editor's text area reads as essentially empty via OCR.
@@ -685,21 +730,12 @@ class AutomationEngine:
         couple of stray characters are tolerated as OCR noise.
         """
         try:
-            screen_w, screen_h = pyautogui.size()
-            left = int(editor_box.left)
-            top = int(editor_box.top) + int(editor_box.height)
-            width = max(int(editor_box.width), 520)
-            height = 460
-
-            left = max(0, min(left, int(screen_w) - 1))
-            top = max(0, min(top, int(screen_h) - 1))
-            width = max(1, min(width, int(screen_w) - left))
-            height = max(1, min(height, int(screen_h) - top))
-
+            left, top, width, height = self._text_area_region(editor_box)
             text = self._read_region_text(left, top, width, height)
             stripped = "".join(c for c in text if c.isalnum())
             self.log("info",
-                     f"Empty check: {len(stripped)} alphanumeric chars remain.")
+                     f"Empty check: {len(stripped)} alphanumeric chars remain. "
+                     f"OCR sample: {text.strip()[:60]!r}")
             return len(stripped) <= 2
         except Exception as exc:
             # Can't verify -> treat as NOT empty, so we retry/abort rather than
@@ -732,17 +768,7 @@ class AutomationEngine:
         (body gone), or abort (header gone = overshoot).
         """
         try:
-            screen_w, screen_h = pyautogui.size()
-            left = int(editor_box.left)
-            top = int(editor_box.top) + int(editor_box.height)
-            width = max(int(editor_box.width), 520)
-            height = 460  # tall enough to include header + full template body
-
-            left = max(0, min(left, int(screen_w) - 1))
-            top = max(0, min(top, int(screen_h) - 1))
-            width = max(1, min(width, int(screen_w) - left))
-            height = max(1, min(height, int(screen_h) - top))
-
+            left, top, width, height = self._text_area_region(editor_box)
             text = self._read_region_text(left, top, width, height)
             digits = "".join(c for c in text if c.isdigit())
             header_present = expected_id in digits
