@@ -963,34 +963,40 @@ class AutomationEngine:
             )
             self._check_abort()
 
-        # 9. Enter the password.
+        # 9. Enter the password by TYPING it.
         #
-        # Pasting is preferred (typed characters can come out wrong through
-        # this RDP session's keyboard layout - the Greek-letter problem). But
-        # some password fields BLOCK paste entirely, in which case Ctrl+V does
-        # nothing and the sign-off silently fails. So: paste, press Enter, and
-        # if the dialog is still open shortly after, fall back to TYPING the
-        # password and pressing Enter again. Self-correcting, no guessing.
-        self.log("info", "Entering signature password (paste attempt)...")
-        pyperclip.copy(self.password)
-        pyautogui.hotkey("ctrl", "v")
+        # TYPING IS PRIMARY, DELIBERATELY. An earlier revision changed this to
+        # clipboard paste (to dodge the Greek-letter keyboard-layout problem
+        # seen in the note editor). That was a mistake: password fields in this
+        # app block Ctrl+V, so the paste silently entered nothing and every
+        # sign-off failed - a step that had previously worked when typed.
+        # Typing is therefore restored as the primary method.
+        #
+        # (The Greek-letter issue does not apply here in practice: it appeared
+        # when typing into a "cold" editor, and by this point a paste has
+        # already happened in the session.)
+        #
+        # Paste is kept only as a FALLBACK, tried once if typing didn't close
+        # the dialog.
+        self.log("info", "Entering signature password (typing)...")
+        pyautogui.typewrite(self.password, interval=0.05)
         time.sleep(0.4)
         pyautogui.press("enter")
         time.sleep(1.5)
 
         if self._find_on_screen(TEMPLATE_VERIFICATION) is not None:
             self.log("warn",
-                     "Verification dialog still open after paste+Enter - the "
-                     "password field may block pasting. Retrying by typing it.")
-            pyautogui.typewrite(self.password, interval=0.05)
+                     "Verification dialog still open after typing the password "
+                     "- trying clipboard paste as a fallback.")
+            pyperclip.copy(self.password)
+            pyautogui.hotkey("ctrl", "v")
             time.sleep(0.4)
             pyautogui.press("enter")
             time.sleep(1.0)
-
-        try:
-            pyperclip.copy("")  # clear the password out of the clipboard
-        except Exception:
-            pass
+            try:
+                pyperclip.copy("")  # don't leave the password in the clipboard
+            except Exception:
+                pass
 
         # 10. Confirm the save actually committed (dialog disappears)
         self._wait_for_template(
