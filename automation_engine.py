@@ -125,7 +125,7 @@ class AutomationEngine:
         # the fallback backspace method's first big chunk - it does not need
         # to be exact, since a top-up loop (checked via OCR) corrects any
         # shortfall, and the header-present check aborts if it ever overshoots.
-        self.backspace_estimate = 320
+        self.backspace_estimate = 324
 
         # pygetwindow/win32gui used ONLY to verify the local RDP client window
         # has real OS focus - not used for anything happening inside the
@@ -866,12 +866,16 @@ class AutomationEngine:
 
         # 7. Paste the clinical note. After the backspace-clear, the caret sits
         # at the END of the header line (everything below was deleted). Press
-        # Enter (plain key - never dropped over RDP) to move to a fresh line
-        # below the header, then paste. The note is newline-prefixed too, as a
-        # belt-and-suspenders margin so it can never run onto the bold header.
+        # Enter once (plain key - never dropped over RDP) to move to a fresh
+        # line below the header, then paste the note as-is.
+        #
+        # NOTE: the pasted text must NOT be newline-prefixed here. It used to
+        # be ("\n" + note_text) as a safety margin, but combined with the Enter
+        # above that produced TWO blank lines between the header and the note.
+        # The Enter alone is the single line break we want.
         pyautogui.press("enter")
         time.sleep(0.2)
-        pyperclip.copy("\n" + record.note_text)
+        pyperclip.copy(record.note_text)
         pyautogui.hotkey("ctrl", "v")
         time.sleep(0.8)
         self._check_abort()
