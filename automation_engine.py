@@ -125,7 +125,7 @@ class AutomationEngine:
         # the fallback backspace method's first big chunk - it does not need
         # to be exact, since a top-up loop (checked via OCR) corrects any
         # shortfall, and the header-present check aborts if it ever overshoots.
-        self.backspace_estimate = 324
+        self.backspace_estimate = 323
 
         # pygetwindow/win32gui used ONLY to verify the local RDP client window
         # has real OS focus - not used for anything happening inside the
