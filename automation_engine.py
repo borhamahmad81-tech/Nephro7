@@ -103,29 +103,19 @@ class AutomationEngine:
         # (the last template line) is the default. Checked BEFORE paste, so a
         # note that happens to contain the word later cannot cause a false
         # positive.
-        # Sentinel word used to confirm the template body is fully deleted.
-        # Because the backspace clear deletes BOTTOM-UP, the FIRST body line
-        # ('Complaint') is the LAST thing to disappear - so its absence means
-        # the whole body is gone. (If it were the bottom line, the loop would
-        # stop far too early.) It must not appear in the one-line header.
+        # Sentinel/marker settings used when verifying the body was cleared.
+        # 'Complaint' is the FIRST body line, so if it is absent the whole
+        # template body is gone. It must not appear in the one-line header.
         self.clear_sentinel = "Complaint"
 
         # Vertical offset (pixels) from the TOP of the matched PROGRESS NOTES
         # tab template down to the editor BODY TEXT (around the "Complaint"
-        # line), where we click to lock input focus before clearing. The old
-        # value landed on the toolbar (focus didn't lock, backspace did
-        # nothing). The editor opens at a consistent vertical spot, so a fixed
-        # offset works. If the focus-click misses the text, adjust: larger =
-        # lower.
+        # line), where we click to lock input focus before clearing. An earlier
+        # value landed on the toolbar, so focus never reached the document and
+        # no keystroke afterwards did anything. The editor opens at a
+        # consistent vertical spot, so a fixed offset works. If the focus-click
+        # misses the text, adjust: larger = lower.
         self.editor_click_dy = 190
-
-        # Estimated character count of the fixed template body (from
-        # "Complaint:" through "Educational:", the part that gets deleted).
-        # Computed from the template text as pasted by the user. Used ONLY as
-        # the fallback backspace method's first big chunk - it does not need
-        # to be exact, since a top-up loop (checked via OCR) corrects any
-        # shortfall, and the header-present check aborts if it ever overshoots.
-        self.backspace_estimate = 323
 
         # pygetwindow/win32gui used ONLY to verify the local RDP client window
         # has real OS focus - not used for anything happening inside the
@@ -588,100 +578,163 @@ class AutomationEngine:
 
     def _clear_template_body(self, editor_box, expected_id):
         """
-        Keep the bold header line, delete the template body below it, via
-        Backspace only - no select-and-delete, no Enter insertion.
+        SELECT-AND-DELETE VARIANT.
 
-        History: a hybrid that tried Ctrl+Shift+End first, falling back to
-        Backspace, left a stray extra blank line (from the Enter it inserted
-        for the select attempt) when the fast path failed and the fallback
-        ran on top of it. Backspace has proven to be the one reliable method
-        here, so we commit to it alone - simpler, no leftover artifacts from
-        an abandoned first attempt.
+        Keep the bold header line, delete the template body below it using
+        Ctrl+Shift+End -> Delete (fast, one shot) instead of backspacing.
 
-        Sequence: click into body text (focus) -> Ctrl+End (confirm caret at
-        the true end) -> backspace in a big estimated chunk -> check -> top up
-        in small increments until clear.
+        CORRECTED SEQUENCING - the likely reason earlier attempts failed:
 
-        STOP CONDITION FIX: earlier this checked "has the word 'Complaint'
-        disappeared", but a PARTIAL deletion (e.g. backspacing "Complaint"
-        down to just "Co") already makes that exact word not match, so the
-        loop declared success with a remnant still on screen. The check now
-        requires the region below the header to be essentially EMPTY (very
-        little non-whitespace/non-bullet text left), not just missing one
-        keyword - so a partial remnant like "Co" is correctly seen as "not
-        cleared yet" and gets swept up too.
+        1. MODIFIER RELEASE ORDER. Previously the release was
+              keyUp(shift) then keyUp(ctrl)
+           i.e. Shift was released FIRST. If the remote app processes those
+           release events with any lag, there is a window where it sees Ctrl
+           held but Shift already gone - and Ctrl+End WITHOUT Shift means
+           "move caret to end, select nothing". That matches the observed
+           symptom exactly (caret jumped to the bottom, nothing selected,
+           Delete did nothing). Now SHIFT IS RELEASED LAST, so the selection
+           modifier is never absent while Ctrl is still down.
+
+        2. EXPLICIT END KEY DOWN/UP. pyautogui.press("end") is itself a
+           down+up pair fired back-to-back; inside a held-modifier state over
+           RDP that can misfire. We now send keyDown("end") / keyUp("end")
+           explicitly with delays, so the End keystroke is unambiguous while
+           both modifiers are definitely held.
+
+        3. GENEROUS DELAYS between every key transition, so RDP has time to
+           actually deliver each event rather than coalescing them.
+
+        Sequence: click into body text (locks focus) -> Ctrl+Home -> End
+        (end of the single header line) -> Enter, Enter (two blank lines
+        below the header, as requested) -> Ctrl+Shift+End (select everything
+        from there to the true end) -> Delete.
+
+        Verification: OCR-check that the
+        area below the header is essentially empty AND the header ID is still
+        present. If the body is still there, it retries the select+delete
+        once; if the header is gone, it aborts immediately.
         """
-        self._park_cursor_safe()
+        MOD_DELAY = 0.18   # generous, so RDP delivers each modifier event
 
-        bx, by = int(editor_box.left), int(editor_box.top)
-        focus_x = bx + 60
-        focus_y = by + self.editor_click_dy
-        self.log("info", f"Clicking editor body to lock focus at ({focus_x}, {focus_y}).")
-        pyautogui.click(focus_x, focus_y)
-        time.sleep(0.4)
+        def _select_to_end_and_delete():
+            # Ctrl+Shift+End with corrected ordering: press modifiers, hold,
+            # explicit End down/up, then release SHIFT LAST.
+            pyautogui.keyDown("ctrl")
+            time.sleep(MOD_DELAY)
+            pyautogui.keyDown("shift")
+            time.sleep(MOD_DELAY)
 
-        # Confirm caret at the true end of the document.
-        for m in ["ctrl"]:
-            pyautogui.keyDown(m)
-            time.sleep(0.12)
-        pyautogui.press("end")
-        time.sleep(0.12)
-        pyautogui.keyUp("ctrl")
-        time.sleep(0.3)
+            pyautogui.keyDown("end")
+            time.sleep(MOD_DELAY)
+            pyautogui.keyUp("end")
+            time.sleep(MOD_DELAY)
 
-        # One big estimated chunk first (fast), then check.
-        self.log("info", f"Backspacing estimated chunk of {self.backspace_estimate} chars...")
-        for _ in range(self.backspace_estimate):
-            pyautogui.press("backspace")
-            time.sleep(0.015)
-        time.sleep(0.3)
+            # Release Ctrl first, Shift LAST - never leave Ctrl held without
+            # Shift, which would read as a plain Ctrl+End (move, no select).
+            pyautogui.keyUp("ctrl")
+            time.sleep(MOD_DELAY)
+            pyautogui.keyUp("shift")
+            time.sleep(MOD_DELAY)
 
-        TOP_UP = 20
-        MAX_TOP_UPS = 25
-        for i in range(MAX_TOP_UPS):
-            self._check_abort()
-            header_present, body_present = self._read_clear_state(editor_box, expected_id)
+            pyautogui.press("delete")
+            time.sleep(0.5)
+
+        def _do_clear_attempt():
+            self._park_cursor_safe()
+
+            # Click into the editor BODY TEXT to lock input focus.
+            bx, by = int(editor_box.left), int(editor_box.top)
+            focus_x = bx + 60
+            focus_y = by + self.editor_click_dy
             self.log("info",
-                     f"Backspace check {i + 1}: header_present={header_present}, "
-                     f"body_remnant_present={body_present}")
+                     f"Clicking editor body to lock focus at ({focus_x}, {focus_y}).")
+            pyautogui.click(focus_x, focus_y)
+            time.sleep(0.5)
 
-            if not header_present:
-                # Before concluding overshoot, re-read once - a transient OCR
-                # glitch (screen redraw lag) looks identical to a real
-                # overshoot on a single read. Only abort if it's STILL missing.
-                time.sleep(0.4)
-                header_present_retry, _ = self._read_clear_state(editor_box, expected_id)
-                if header_present_retry:
-                    self.log("warn",
-                             "Header not read on first check but confirmed present "
-                             "on re-check (likely a transient OCR glitch) - continuing.")
-                    header_present = True
-                else:
-                    self._save_timeout_screenshot("header_overshoot")
-                    raise RuntimeError(
-                        f"Backspace clear overshot the header (patient ID "
-                        f"{expected_id} no longer visible, confirmed on re-check) "
-                        "- aborting to avoid saving a damaged header. A "
-                        "screenshot was saved."
-                    )
+            # Ctrl+Home to the very top (start of the header line).
+            pyautogui.keyDown("ctrl")
+            time.sleep(MOD_DELAY)
+            pyautogui.keyDown("home")
+            time.sleep(MOD_DELAY)
+            pyautogui.keyUp("home")
+            time.sleep(MOD_DELAY)
+            pyautogui.keyUp("ctrl")
+            time.sleep(0.35)
 
-            if not body_present:
-                self.log("success",
-                         f"Template body cleared (estimated chunk + {i} "
-                         f"top-up(s)), header intact.")
-                return
-
-            for _ in range(TOP_UP):
-                pyautogui.press("backspace")
-                time.sleep(0.015)
+            # End of the single header line.
+            pyautogui.press("end")
             time.sleep(0.25)
 
-        self._save_timeout_screenshot("body_not_cleared")
-        raise RuntimeError(
-            "Could not fully clear the template body within the top-up limit "
-            "- stopping rather than pasting under a partial remnant. A "
-            "screenshot was saved."
-        )
+            # TWO Enters below the header, as requested.
+            pyautogui.press("enter")
+            time.sleep(0.2)
+            pyautogui.press("enter")
+            time.sleep(0.3)
+
+            # Select from here to the true end and delete it.
+            self.log("info", "Selecting to end (Ctrl+Shift+End) and deleting...")
+            _select_to_end_and_delete()
+
+        _do_clear_attempt()
+
+        header_present, body_present = self._read_clear_state(editor_box, expected_id)
+        self.log("info",
+                 f"Select+delete check: header_present={header_present}, "
+                 f"body_remnant_present={body_present}")
+
+        if not header_present:
+            time.sleep(0.4)
+            header_present_retry, _ = self._read_clear_state(editor_box, expected_id)
+            if header_present_retry:
+                self.log("warn",
+                         "Header not read on first check but confirmed present on "
+                         "re-check (transient OCR glitch) - continuing.")
+                header_present = True
+            else:
+                self._save_timeout_screenshot("header_overshoot_select")
+                raise RuntimeError(
+                    f"Select+delete appears to have damaged the header (patient "
+                    f"ID {expected_id} no longer visible, confirmed on re-check) "
+                    "- aborting. A screenshot was saved."
+                )
+
+        if not body_present:
+            self.log("success",
+                     "Template body cleared via Ctrl+Shift+End + Delete, header intact.")
+            return
+
+        # Body still present - retry the whole select+delete once.
+        self.log("warn",
+                 "Body still present after select+delete - retrying the "
+                 "select+delete once.")
+        _do_clear_attempt()
+
+        header_present, body_present = self._read_clear_state(editor_box, expected_id)
+        self.log("info",
+                 f"Select+delete retry check: header_present={header_present}, "
+                 f"body_remnant_present={body_present}")
+
+        if not header_present:
+            self._save_timeout_screenshot("header_overshoot_select")
+            raise RuntimeError(
+                f"Select+delete (retry) appears to have damaged the header "
+                f"(patient ID {expected_id} no longer visible) - aborting. A "
+                "screenshot was saved."
+            )
+
+        if body_present:
+            self._save_timeout_screenshot("body_not_cleared_select")
+            raise RuntimeError(
+                "Ctrl+Shift+End + Delete did not clear the template body after "
+                "two attempts - stopping rather than pasting under a partial "
+                "template. A screenshot was saved."
+                "this keeps happening.)"
+            )
+
+        self.log("success",
+                 "Template body cleared via Ctrl+Shift+End + Delete on retry, "
+                 "header intact.")
+        return
 
     def _read_clear_state(self, editor_box, expected_id):
         """
@@ -704,7 +757,7 @@ class AutomationEngine:
         before judging "substantial", so a lone leftover bullet doesn't count,
         but a word fragment like "Co" correctly does.
 
-        Used by the backspace-clear loop to decide: keep deleting, stop
+        Used by the clear routine to decide: done, keep going, or abort.
         (body gone), or abort (header gone = overshoot).
         """
         try:
@@ -864,17 +917,14 @@ class AutomationEngine:
         self._clear_template_body(editor_box, record.patient_id)
         self._check_abort()
 
-        # 7. Paste the clinical note. After the backspace-clear, the caret sits
-        # at the END of the header line (everything below was deleted). Press
-        # Enter once (plain key - never dropped over RDP) to move to a fresh
-        # line below the header, then paste the note as-is.
+        # 7. Paste the clinical note.
         #
-        # NOTE: the pasted text must NOT be newline-prefixed here. It used to
-        # be ("\n" + note_text) as a safety margin, but combined with the Enter
-        # above that produced TWO blank lines between the header and the note.
-        # The Enter alone is the single line break we want.
-        pyautogui.press("enter")
-        time.sleep(0.2)
+        # IMPORTANT (select variant): the clear step above already pressed TWO
+        # Enters below the header and then deleted everything from that point
+        # to the end. So the caret is ALREADY sitting on an empty line two
+        # lines below the header - exactly where the note should start. Do NOT
+        # press Enter again here and do NOT newline-prefix the pasted text, or
+        # you get extra blank lines stacking up.
         pyperclip.copy(record.note_text)
         pyautogui.hotkey("ctrl", "v")
         time.sleep(0.8)
