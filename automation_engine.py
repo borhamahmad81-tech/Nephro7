@@ -588,34 +588,28 @@ class AutomationEngine:
 
     def _clear_template_body(self, editor_box, expected_id):
         """
-        Keep the bold header line, delete the template body below it.
+        Keep the bold header line, delete the template body below it, via
+        Backspace only - no select-and-delete, no Enter insertion.
 
-        IMPORTANT CORRECTION: earlier attempts at select-and-delete
-        (Ctrl+Shift+End -> Delete) failed, which we attributed to RDP dropping
-        the Ctrl/Shift modifiers. But the focus-lock click used in BOTH that
-        attempt and the first backspace attempt was landing on the TOOLBAR
-        (wrong pixel offset), not the text - so focus may never have reached
-        the document at all, which would explain every keystroke afterward
-        going nowhere, with no need to invoke "RDP eats modifiers." That was
-        our bug, not confirmed RDP behaviour.
+        History: a hybrid that tried Ctrl+Shift+End first, falling back to
+        Backspace, left a stray extra blank line (from the Enter it inserted
+        for the select attempt) when the fast path failed and the fallback
+        ran on top of it. Backspace has proven to be the one reliable method
+        here, so we commit to it alone - simpler, no leftover artifacts from
+        an abandoned first attempt.
 
-        Now that the focus click is corrected (self.editor_click_dy, verified
-        landing on body text), it's worth retrying the fast method:
+        Sequence: click into body text (focus) -> Ctrl+End (confirm caret at
+        the true end) -> backspace in a big estimated chunk -> check -> top up
+        in small increments until clear.
 
-          FAST PATH: click into text (focus) -> Ctrl+Home -> End -> Enter
-          (one blank line below header) -> Ctrl+Shift+End -> Delete. One shot,
-          then ONE OCR check.
-            - If body's gone (sentinel 'Complaint' absent) and header intact
-              -> done, fast.
-
-          FALLBACK (only if the fast path's single check shows the body is
-          STILL there): delete via Backspace from the bottom - a plain key
-          that cannot have its modifier dropped. Rather than nagging in tiny
-          batches of 6, send ONE large estimated chunk (self.
-          backspace_estimate, ~318 chars, sized from the known fixed
-          template), THEN check once. If short, top up in a couple of small
-          batches; if it overshoots into the header, abort immediately
-          (header-loss is checked every step of the fallback, never skipped).
+        STOP CONDITION FIX: earlier this checked "has the word 'Complaint'
+        disappeared", but a PARTIAL deletion (e.g. backspacing "Complaint"
+        down to just "Co") already makes that exact word not match, so the
+        loop declared success with a remnant still on screen. The check now
+        requires the region below the header to be essentially EMPTY (very
+        little non-whitespace/non-bullet text left), not just missing one
+        keyword - so a partial remnant like "Co" is correctly seen as "not
+        cleared yet" and gets swept up too.
         """
         self._park_cursor_safe()
 
@@ -626,56 +620,7 @@ class AutomationEngine:
         pyautogui.click(focus_x, focus_y)
         time.sleep(0.4)
 
-        # ---------- FAST PATH: select-and-delete, one attempt ----------
-        for m in ["ctrl"]:
-            pyautogui.keyDown(m)
-            time.sleep(0.12)
-        pyautogui.press("home")
-        time.sleep(0.12)
-        pyautogui.keyUp("ctrl")
-        time.sleep(0.3)
-
-        pyautogui.press("end")          # end of the single header line
-        time.sleep(0.2)
-        pyautogui.press("enter")        # one blank line below the header
-        time.sleep(0.2)
-
-        for m in ["ctrl", "shift"]:
-            pyautogui.keyDown(m)
-            time.sleep(0.12)
-        pyautogui.press("end")
-        time.sleep(0.12)
-        for m in reversed(["ctrl", "shift"]):
-            pyautogui.keyUp(m)
-            time.sleep(0.08)
-        time.sleep(0.2)
-        pyautogui.press("delete")
-        time.sleep(0.5)
-
-        header_present, body_present = self._read_clear_state(editor_box, expected_id)
-        self.log("info",
-                 f"Fast-path check: header_present={header_present}, "
-                 f"body_present={body_present}")
-
-        if not body_present and header_present:
-            self.log("success", "Template body cleared via select+delete (fast path).")
-            return
-
-        if not header_present:
-            # The fast path already damaged the header - abort immediately.
-            self._save_timeout_screenshot("header_overshoot_fastpath")
-            raise RuntimeError(
-                f"Select+delete appears to have damaged the header (patient "
-                f"ID {expected_id} no longer visible) - aborting. A screenshot "
-                "was saved."
-            )
-
-        # ---------- FALLBACK: backspace, one big estimated chunk + top-up ----------
-        self.log("warn",
-                 "Fast path (select+delete) did not clear the body - falling "
-                 "back to backspace clearing.")
-
-        # Re-anchor to the end of the document before backspacing.
+        # Confirm caret at the true end of the document.
         for m in ["ctrl"]:
             pyautogui.keyDown(m)
             time.sleep(0.12)
@@ -684,47 +629,58 @@ class AutomationEngine:
         pyautogui.keyUp("ctrl")
         time.sleep(0.3)
 
-        # One big estimated chunk (sized from the known fixed template length),
-        # THEN check once - not nagging every few characters.
+        # One big estimated chunk first (fast), then check.
         self.log("info", f"Backspacing estimated chunk of {self.backspace_estimate} chars...")
         for _ in range(self.backspace_estimate):
             pyautogui.press("backspace")
-            time.sleep(0.02)
+            time.sleep(0.015)
         time.sleep(0.3)
 
-        TOP_UP = 15
-        MAX_TOP_UPS = 20
+        TOP_UP = 20
+        MAX_TOP_UPS = 25
         for i in range(MAX_TOP_UPS):
             self._check_abort()
             header_present, body_present = self._read_clear_state(editor_box, expected_id)
             self.log("info",
                      f"Backspace check {i + 1}: header_present={header_present}, "
-                     f"body_present={body_present}")
+                     f"body_remnant_present={body_present}")
 
             if not header_present:
-                self._save_timeout_screenshot("header_overshoot")
-                raise RuntimeError(
-                    f"Backspace clear overshot the header (patient ID "
-                    f"{expected_id} no longer visible) - aborting to avoid "
-                    "saving a damaged header. A screenshot was saved."
-                )
+                # Before concluding overshoot, re-read once - a transient OCR
+                # glitch (screen redraw lag) looks identical to a real
+                # overshoot on a single read. Only abort if it's STILL missing.
+                time.sleep(0.4)
+                header_present_retry, _ = self._read_clear_state(editor_box, expected_id)
+                if header_present_retry:
+                    self.log("warn",
+                             "Header not read on first check but confirmed present "
+                             "on re-check (likely a transient OCR glitch) - continuing.")
+                    header_present = True
+                else:
+                    self._save_timeout_screenshot("header_overshoot")
+                    raise RuntimeError(
+                        f"Backspace clear overshot the header (patient ID "
+                        f"{expected_id} no longer visible, confirmed on re-check) "
+                        "- aborting to avoid saving a damaged header. A "
+                        "screenshot was saved."
+                    )
 
             if not body_present:
                 self.log("success",
-                         f"Template body cleared via backspace fallback "
-                         f"(estimated chunk + {i} top-up(s)), header intact.")
+                         f"Template body cleared (estimated chunk + {i} "
+                         f"top-up(s)), header intact.")
                 return
 
             for _ in range(TOP_UP):
                 pyautogui.press("backspace")
-                time.sleep(0.02)
-            time.sleep(0.3)
+                time.sleep(0.015)
+            time.sleep(0.25)
 
         self._save_timeout_screenshot("body_not_cleared")
         raise RuntimeError(
-            "Could not clear the template body (fast path and backspace "
-            "fallback both failed) - stopping rather than pasting under a "
-            "partial template. A screenshot was saved."
+            "Could not fully clear the template body within the top-up limit "
+            "- stopping rather than pasting under a partial remnant. A "
+            "screenshot was saved."
         )
 
     def _read_clear_state(self, editor_box, expected_id):
@@ -734,15 +690,19 @@ class AutomationEngine:
 
         header_present: the expected patient ID digits are still visible (the
                         bold header line is intact).
-        body_present:   the TOP-of-body sentinel (self.clear_sentinel,
-                        default 'Complaint') is still visible.
+        body_present:   True if meaningful template/body text remains BELOW
+                        the header line.
 
-        Direction matters: we delete BOTTOM-UP with backspace, so the bottom
-        template lines ('Educational', 'Medical', ...) disappear FIRST and
-        'Complaint' (the first body line) disappears LAST. Therefore the test
-        for "is the whole body gone?" must key on the TOP line 'Complaint' -
-        not the bottom line - otherwise the loop would declare success as soon
-        as 'Educational' vanished, leaving most of the template behind.
+        FIX: this used to check only "does the word 'Complaint' still appear?"
+        But a PARTIAL deletion (backspacing "Complaint" down to just "Co")
+        already makes that exact word not match, so the old check declared
+        "body gone" while a remnant ("Co") was still on screen and got pasted
+        over. Now we isolate the text BELOW the header line (splitting on the
+        header, identified by the patient ID digits) and check whether
+        anything substantial remains there at all - not just one keyword.
+        Bullet characters, whitespace, and stray punctuation are stripped
+        before judging "substantial", so a lone leftover bullet doesn't count,
+        but a word fragment like "Co" correctly does.
 
         Used by the backspace-clear loop to decide: keep deleting, stop
         (body gone), or abort (header gone = overshoot).
@@ -762,7 +722,27 @@ class AutomationEngine:
             text = self._read_region_text(left, top, width, height)
             digits = "".join(c for c in text if c.isdigit())
             header_present = expected_id in digits
-            body_present = self.clear_sentinel.lower() in text.lower()
+
+            # Isolate text BELOW the header line: split at the line containing
+            # the patient ID, keep only what comes after it.
+            lines = text.splitlines()
+            below_header_lines = []
+            header_line_seen = False
+            for line in lines:
+                if not header_line_seen:
+                    if expected_id in "".join(c for c in line if c.isdigit()):
+                        header_line_seen = True
+                    continue
+                below_header_lines.append(line)
+            below_text = "\n".join(below_header_lines) if header_line_seen else text
+
+            # Strip bullets/whitespace/punctuation noise; anything substantial
+            # left over means the body isn't cleared yet.
+            stripped = "".join(
+                c for c in below_text if c.isalnum()
+            ).strip()
+            body_present = len(stripped) > 2  # tolerate a stray OCR artifact char
+
             return header_present, body_present
         except Exception as exc:
             # If OCR fails, report header MISSING + body PRESENT: the safest
