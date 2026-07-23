@@ -576,73 +576,52 @@ class AutomationEngine:
         digits = "".join(c for c in text if c.isdigit())
         return expected_id in digits
 
-    def _clear_template_body(self, editor_box, expected_id):
+    def _select_all_and_replace(self, editor_box, record):
         """
-        SELECT-AND-DELETE VARIANT.
+        Replace the entire note content: Ctrl+A -> Delete -> paste the docx
+        header followed by the clinical note.
 
-        Keep the bold header line, delete the template body below it using
-        Ctrl+Shift+End -> Delete (fast, one shot) instead of backspacing.
+        WHY THIS METHOD. Through this pipeline, two-modifier combos
+        (Ctrl+Shift+End) do not work - proven by a clean experiment: the two
+        Enters inserted just before it DID land (a visible gap appeared under
+        the header), so focus was live and every plain key and single-modifier
+        combo worked; only the selection failed. That rules out every approach
+        that tries to select just the body below the header.
 
-        CORRECTED SEQUENCING - the likely reason earlier attempts failed:
+        Ctrl+A is a SINGLE modifier combo - the same class as Ctrl+Home, which
+        demonstrably works here - so it has a far better chance. It selects
+        everything INCLUDING the header, which is acceptable because we paste
+        our own header back from the docx (record.header_text).
 
-        1. MODIFIER RELEASE ORDER. Previously the release was
-              keyUp(shift) then keyUp(ctrl)
-           i.e. Shift was released FIRST. If the remote app processes those
-           release events with any lag, there is a window where it sees Ctrl
-           held but Shift already gone - and Ctrl+End WITHOUT Shift means
-           "move caret to end, select nothing". That matches the observed
-           symptom exactly (caret jumped to the bottom, nothing selected,
-           Delete did nothing). Now SHIFT IS RELEASED LAST, so the selection
-           modifier is never absent while Ctrl is still down.
+        TRADE-OFF: the pasted header is plain text and loses the EMR's bold
+        styling. This is a deliberate trade for a clear that actually works.
 
-        2. EXPLICIT END KEY DOWN/UP. pyautogui.press("end") is itself a
-           down+up pair fired back-to-back; inside a held-modifier state over
-           RDP that can misfire. We now send keyDown("end") / keyUp("end")
-           explicitly with delays, so the End keystroke is unambiguous while
-           both modifiers are definitely held.
-
-        3. GENEROUS DELAYS between every key transition, so RDP has time to
-           actually deliver each event rather than coalescing them.
-
-        Sequence: click into body text (locks focus) -> Ctrl+Home -> End
-        (end of the single header line) -> Enter, Enter (two blank lines
-        below the header, as requested) -> Ctrl+Shift+End (select everything
-        from there to the true end) -> Delete.
-
-        Verification: OCR-check that the
-        area below the header is essentially empty AND the header ID is still
-        present. If the body is still there, it retries the select+delete
-        once; if the header is gone, it aborts immediately.
+        SAFETY:
+          - The correct-patient check (step 5b) already confirmed the EMR's own
+            header showed THIS patient BEFORE anything is deleted.
+          - After Delete we OCR-verify the editor is genuinely EMPTY. If any
+            text remains, the select/delete failed - we retry once, then abort
+            rather than paste on top of a surviving template.
+          - After pasting we OCR-verify the patient ID is present again, so a
+            failed paste can't silently leave an empty note.
         """
-        MOD_DELAY = 0.18   # generous, so RDP delivers each modifier event
+        MOD_DELAY = 0.18
 
-        def _select_to_end_and_delete():
-            # Ctrl+Shift+End with corrected ordering: press modifiers, hold,
-            # explicit End down/up, then release SHIFT LAST.
+        def _ctrl_a_delete():
+            # Ctrl+A with explicit hold + delays (single modifier).
             pyautogui.keyDown("ctrl")
             time.sleep(MOD_DELAY)
-            pyautogui.keyDown("shift")
+            pyautogui.keyDown("a")
             time.sleep(MOD_DELAY)
-
-            pyautogui.keyDown("end")
+            pyautogui.keyUp("a")
             time.sleep(MOD_DELAY)
-            pyautogui.keyUp("end")
-            time.sleep(MOD_DELAY)
-
-            # Release Ctrl first, Shift LAST - never leave Ctrl held without
-            # Shift, which would read as a plain Ctrl+End (move, no select).
             pyautogui.keyUp("ctrl")
-            time.sleep(MOD_DELAY)
-            pyautogui.keyUp("shift")
-            time.sleep(MOD_DELAY)
-
+            time.sleep(0.3)
             pyautogui.press("delete")
             time.sleep(0.5)
 
-        def _do_clear_attempt():
+        def _focus_click():
             self._park_cursor_safe()
-
-            # Click into the editor BODY TEXT to lock input focus.
             bx, by = int(editor_box.left), int(editor_box.top)
             focus_x = bx + 60
             focus_y = by + self.editor_click_dy
@@ -651,90 +630,82 @@ class AutomationEngine:
             pyautogui.click(focus_x, focus_y)
             time.sleep(0.5)
 
-            # Ctrl+Home to the very top (start of the header line).
-            pyautogui.keyDown("ctrl")
-            time.sleep(MOD_DELAY)
-            pyautogui.keyDown("home")
-            time.sleep(MOD_DELAY)
-            pyautogui.keyUp("home")
-            time.sleep(MOD_DELAY)
-            pyautogui.keyUp("ctrl")
-            time.sleep(0.35)
+        # --- clear everything ---
+        _focus_click()
+        self.log("info", "Selecting all (Ctrl+A) and deleting...")
+        _ctrl_a_delete()
 
-            # End of the single header line.
-            pyautogui.press("end")
-            time.sleep(0.25)
-
-            # TWO Enters below the header, as requested.
-            pyautogui.press("enter")
-            time.sleep(0.2)
-            pyautogui.press("enter")
-            time.sleep(0.3)
-
-            # Select from here to the true end and delete it.
-            self.log("info", "Selecting to end (Ctrl+Shift+End) and deleting...")
-            _select_to_end_and_delete()
-
-        _do_clear_attempt()
-
-        header_present, body_present = self._read_clear_state(editor_box, expected_id)
-        self.log("info",
-                 f"Select+delete check: header_present={header_present}, "
-                 f"body_remnant_present={body_present}")
-
-        if not header_present:
-            time.sleep(0.4)
-            header_present_retry, _ = self._read_clear_state(editor_box, expected_id)
-            if header_present_retry:
-                self.log("warn",
-                         "Header not read on first check but confirmed present on "
-                         "re-check (transient OCR glitch) - continuing.")
-                header_present = True
-            else:
-                self._save_timeout_screenshot("header_overshoot_select")
+        if not self._editor_appears_empty(editor_box):
+            self.log("warn",
+                     "Editor not empty after Ctrl+A + Delete - retrying once.")
+            _focus_click()
+            _ctrl_a_delete()
+            if not self._editor_appears_empty(editor_box):
+                self._save_timeout_screenshot("editor_not_empty")
                 raise RuntimeError(
-                    f"Select+delete appears to have damaged the header (patient "
-                    f"ID {expected_id} no longer visible, confirmed on re-check) "
-                    "- aborting. A screenshot was saved."
+                    "Ctrl+A + Delete did not clear the note after two attempts "
+                    "- stopping rather than pasting on top of the existing "
+                    "template. A screenshot was saved."
                 )
 
-        if not body_present:
-            self.log("success",
-                     "Template body cleared via Ctrl+Shift+End + Delete, header intact.")
-            return
+        self.log("success", "Editor cleared (verified empty).")
 
-        # Body still present - retry the whole select+delete once.
-        self.log("warn",
-                 "Body still present after select+delete - retrying the "
-                 "select+delete once.")
-        _do_clear_attempt()
+        # --- paste header + note ---
+        header = (record.header_text or "").strip()
+        body = record.note_text or ""
+        content = (header + "\n\n" + body) if header else body
 
-        header_present, body_present = self._read_clear_state(editor_box, expected_id)
-        self.log("info",
-                 f"Select+delete retry check: header_present={header_present}, "
-                 f"body_remnant_present={body_present}")
+        pyperclip.copy(content)
+        pyautogui.hotkey("ctrl", "v")
+        time.sleep(1.0)
 
+        # Verify the paste actually landed and shows this patient.
+        header_present, _ = self._read_clear_state(editor_box, record.patient_id)
         if not header_present:
-            self._save_timeout_screenshot("header_overshoot_select")
+            time.sleep(0.5)
+            header_present, _ = self._read_clear_state(editor_box, record.patient_id)
+        if not header_present:
+            self._save_timeout_screenshot("paste_not_verified")
             raise RuntimeError(
-                f"Select+delete (retry) appears to have damaged the header "
-                f"(patient ID {expected_id} no longer visible) - aborting. A "
-                "screenshot was saved."
-            )
-
-        if body_present:
-            self._save_timeout_screenshot("body_not_cleared_select")
-            raise RuntimeError(
-                "Ctrl+Shift+End + Delete did not clear the template body after "
-                "two attempts - stopping rather than pasting under a partial "
-                "template. A screenshot was saved."
-                "this keeps happening.)"
+                f"After pasting, patient ID {record.patient_id} was not visible "
+                "in the note - the paste may have failed. Stopping rather than "
+                "signing an empty or wrong note. A screenshot was saved."
             )
 
         self.log("success",
-                 "Template body cleared via Ctrl+Shift+End + Delete on retry, "
-                 "header intact.")
-        return
+                 f"Header + note pasted and verified for patient "
+                 f"{record.patient_id}.")
+
+    def _editor_appears_empty(self, editor_box):
+        """
+        True if the editor's text area reads as essentially empty via OCR.
+
+        Used right after Ctrl+A + Delete. Because that deletes the header too,
+        "empty" here means NO meaningful text at all - not "header only". A
+        couple of stray characters are tolerated as OCR noise.
+        """
+        try:
+            screen_w, screen_h = pyautogui.size()
+            left = int(editor_box.left)
+            top = int(editor_box.top) + int(editor_box.height)
+            width = max(int(editor_box.width), 520)
+            height = 460
+
+            left = max(0, min(left, int(screen_w) - 1))
+            top = max(0, min(top, int(screen_h) - 1))
+            width = max(1, min(width, int(screen_w) - left))
+            height = max(1, min(height, int(screen_h) - top))
+
+            text = self._read_region_text(left, top, width, height)
+            stripped = "".join(c for c in text if c.isalnum())
+            self.log("info",
+                     f"Empty check: {len(stripped)} alphanumeric chars remain.")
+            return len(stripped) <= 2
+        except Exception as exc:
+            # Can't verify -> treat as NOT empty, so we retry/abort rather than
+            # assume success and paste into a surviving template.
+            self.log("error", f"Empty-check OCR error: {type(exc).__name__}: {exc}")
+            return False
 
     def _read_clear_state(self, editor_box, expected_id):
         """
@@ -898,36 +869,25 @@ class AutomationEngine:
         self._wait_for_correct_patient_header(record.patient_id, editor_box)
         self._check_abort()
 
-        # 6. Keep the header line (exactly one line), clear the template body
-        # below it, THEN paste - so the note replaces the template instead of
-        # being appended under it.
+        # 6+7. Replace the ENTIRE note content: Ctrl+A -> Delete -> paste the
+        # header (from the docx) followed by the clinical note.
         #
-        # Root cause of the earlier "note appended below intact template" bug:
-        # over RDP the FIRST keystroke after the OCR read loop gets dropped
-        # (the same dropped-first-keystroke issue F3 already guards against).
-        # The dropped key was Ctrl+Home, so the caret never went to the top;
-        # the selection/delete then did nothing while the later paste still
-        # landed - appending. Guards below:
-        #   - settle after the OCR loop,
-        #   - Ctrl+Home sent TWICE (harmless to repeat; defeats the drop),
-        #   - small delays between keys so RDP doesn't coalesce/drop them,
-        #   - after deleting, OCR-verify the template body actually cleared
-        #     (sentinel word gone) before pasting; retry the delete once, then
-        #     abort rather than paste into a half-cleared note.
-        self._clear_template_body(editor_box, record.patient_id)
-        self._check_abort()
-
-        # 7. Paste the clinical note.
+        # Why this approach: through this pipeline, two-modifier combos like
+        # Ctrl+Shift+End do not work (confirmed - the plain keys around it all
+        # landed, only the selection failed), so no method that tries to select
+        # just the body below the header is reliable. Ctrl+A is a SINGLE
+        # modifier combo, the same class as Ctrl+Home which does work here, so
+        # it has a much better chance. It selects everything including the
+        # header, which is fine because we paste our own header back.
         #
-        # IMPORTANT (select variant): the clear step above already pressed TWO
-        # Enters below the header and then deleted everything from that point
-        # to the end. So the caret is ALREADY sitting on an empty line two
-        # lines below the header - exactly where the note should start. Do NOT
-        # press Enter again here and do NOT newline-prefix the pasted text, or
-        # you get extra blank lines stacking up.
-        pyperclip.copy(record.note_text)
-        pyautogui.hotkey("ctrl", "v")
-        time.sleep(0.8)
+        # TRADE-OFF: the pasted header is plain text and loses the EMR's bold
+        # formatting. Accepted deliberately in exchange for a clear that works.
+        #
+        # Safety: the correct-patient check above (5b) already confirmed the
+        # EMR's own header showed THIS patient BEFORE anything is deleted, and
+        # after the delete we verify the editor is genuinely empty before
+        # pasting - so we can't paste on top of a failed clear.
+        self._select_all_and_replace(editor_box, record)
         self._check_abort()
 
         # 8. Open sign-off dialog
